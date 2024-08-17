@@ -249,14 +249,14 @@ THE DRIVER FUNCTION
 """
 
 def d4s_driver(nuc_types, coords, s6, s8, alpha_1, alpha_2, beta_2, s_3body, data, sec_data, r4r2):
+    if len(nuc_types) == 1:
+        return 0, None
+
     energy_disp_e6 = 0
     energy_disp_e8 = 0
     energy_disp_3body = 0
     # Coordination numbers and effective charges
     effective_charges, coordination_numbers = get_cn_and_charges(nuc_types, coords)
-
-    print(coordination_numbers)
-    print(effective_charges)
 
     # List of C6 and C8 coefficients
     # These are only used for 3 body terms and
@@ -284,7 +284,6 @@ def d4s_driver(nuc_types, coords, s6, s8, alpha_1, alpha_2, beta_2, s_3body, dat
                                  atom2_idx, coordination_numbers[d2+d1+1], effective_charges[d2+d1+1], 
                                  beta_2, data)
             
-            print(f"C6 {d1}, {d2}: {c6_12}")
             # Pair C8 coefficient between Atoms 1 and 2
             c8_12 = calculate_C8(c6_12, atom1_idx, atom2_idx, r4r2)
 
@@ -303,6 +302,9 @@ def d4s_driver(nuc_types, coords, s6, s8, alpha_1, alpha_2, beta_2, s_3body, dat
     c6_3body_list += c6_3body_list.T
     c8_3body_list += c8_3body_list.T
 
+    if len(nuc_types) == 2:
+        return - (energy_disp_e8 + energy_disp_e6), None
+
     # Calculation of 3 body terms
     for d1 in range(len(nuc_types)-2):
         nuc_charge_1 = nuc_types[d1]
@@ -315,8 +317,8 @@ def d4s_driver(nuc_types, coords, s6, s8, alpha_1, alpha_2, beta_2, s_3body, dat
             for _d3 in range(len(nuc_types[d1+d2+2:])):
                 # d3 = _d3 + d1 + d2 + 2
                 d3 = _d3
-                nuc_charge_3 = nuc_types[d3+d2+d1+1]
-                atom_coords_3 = coords[d3+d2+d1+1]
+                nuc_charge_3 = nuc_types[d3+d2+d1+2]
+                atom_coords_3 = coords[d3+d2+d1+2]
 
                 # 3 Body distances
                 dist_12 = numpy.linalg.norm(atom_coords_1 - atom_coords_2)
@@ -338,4 +340,4 @@ def d4s_driver(nuc_types, coords, s6, s8, alpha_1, alpha_2, beta_2, s_3body, dat
                 energy_disp_3body += (s_3body * damping_3body(R_damp) * C9 
                                       * (3*cos_factor+1) / (dist_12*dist_23*dist_31)**3)
     
-    return -(energy_disp_e8+energy_disp_e6-energy_disp_3body), None #, c6_3body_list, energy_disp_e6, energy_disp_e8
+    return -(energy_disp_e8 + energy_disp_e6 - energy_disp_3body), None #, c6_3body_list, energy_disp_e6, energy_disp_e8

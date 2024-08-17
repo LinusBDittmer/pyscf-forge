@@ -173,14 +173,12 @@ class DFTD4S_Model(lib.StreamObject):
             elif func == 'hf' and basis_type == 'sv':
                 func, supported_versions = FUNC_CODE['HF/SV']
         else:
-            raise RuntimeError('Functional %s not found' % self.xc)
+            # raise RuntimeError('Functional %s not found' % self.xc)
+            pass
         # assert(self.version in supported_versions)
 
         # Standard D4 params
-        try:
-            std_params = get_damping_param(self.xc_dftd)
-        except:
-            std_params = get_damping_param(self.xc)
+        std_params = get_damping_param(self.xc)
         self.__dict__.update(std_params)
 
         if s6 is not None:

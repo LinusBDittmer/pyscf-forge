@@ -169,6 +169,15 @@ def calculate_ref_C6(atomic_number_i, ref_i, atomic_number_j, ref_j, data):
     c6 = thopi*numpy.sum(alpha_product*weights)
     return c6
 
+def weight(CN_A, atomic_number, ref_number, beta_2, data, weight_method='gaussian', gaussian_window=None):
+    if weight_method == 'gaussian':
+        return gaussian_weight(CN_A, atomic_number, ref_number, beta_2, data)
+    elif weight_method == 'soft_bilinear':
+        return soft_bilinear_weight(CN_A, atomic_number, ref_number, beta_2, data, gaussian_window)
+
+def soft_bilinear_weight(CN_A, atomic_number, ref_number, beta_2, data, gaussian_window):
+    return 0.0
+
 def gaussian_weight(CN_A, atomic_number, ref_number, beta_2, data):
     #Calculates gaussian weights from eq 8 for a particular reference
     N_A_ref = data['refn'][atomic_number]
@@ -196,21 +205,75 @@ def zeta(q_A, atomic_number, ref_number, data):
         zeta = numpy.exp(ga*(1-numpy.exp(gc*data['chemical_hardness'][atomic_number]*(1-z_A_ref/z_A))))
     return zeta
 
-def calculate_C6(atomic_number_A, CN_A, q_A, atomic_number_B, CN_B, q_B, beta_2, data):
+def get_weight_factors(atomic_number, CN_A, beta_2, data):
+    n_window = 16
+    n_refdata = data['refn'][atomic_number]
+    linear_window = numpy.linspace(-5, 5, num=n_window+1)
+    gaussian_window = numpy.exp(-beta_2 * linear_window * linear_window)
+    gaussian_window /= numpy.sum(gaussian_window)
+    CN_A_ref = numpy.array([data['refcovcn'][ref][atomic_number] for ref in range(n_refdata)])
+    
+    def weight_factors(cn):
+        weights = numpy.zeros(CN_A_ref.shape, dtype=float)
+        if cn <= numpy.min(CN_A_ref):
+            weights[numpy.argmin(CN_A_ref)] = 1
+            return weights
+        if cn >= numpy.max(CN_A_ref):
+            weights[numpy.argmax(CN_A_ref)] = 1
+            return weights
+        
+        # Find the left neighbour, i. e. biggest value smaller than cn
+        mask_left = CN_A_ref < cn
+        left_cn = numpy.max(CN_A_ref[mask_left])
+        index_left = numpy.where(CN_A_ref == left_cn)[0][0]
+
+        # Find the right neighbour, i. e. smallest value bigger than cn
+        mask_right = CN_A_ref > cn
+        right_cn = numpy.max(CN_A_ref[mask_right])
+        index_right = numpy.where(CN_A_ref == right_cn)[0][0]
+
+        # Number between 0 and 1 that encodes where cn is in the interval
+        cn_int = (cn - left_cn) / (right_cn - left_cn)
+
+        weights[index_right] = cn_int
+        weights[index_left] = 1 - cn_int
+            
+        return weights
+
+    total_weights = numpy.zeros(CN_A_ref.shape, dtype=float)
+    for i, cn_i in enumerate(linear_window):
+        gweight = weight_factors(cn_i + CN_A)
+        total_weights += gweight * gaussian_window[i]
+
+    return total_weights
+
+
+def calculate_C6(atomic_number_A, CN_A, q_A, atomic_number_B, CN_B, q_B, beta_2, data, weight_method='gaussian'):
     #Computes C6_AB coefficient
     N_A_ref = data['refn'][atomic_number_A]
     N_B_ref = data['refn'][atomic_number_B]
     C6 = 0
-    for ref_i in range(N_A_ref):
-        for ref_j in range(N_B_ref):
-            ref_c6 = calculate_ref_C6(atomic_number_A, ref_i, atomic_number_B, ref_j, data)
-            #print(f"REF: {ref_i} (CN={data['refcn'][ref_i][atomic_number_A]}), {ref_j} (CN={data['refcn'][ref_j][atomic_number_B]}). C6: {ref_c6}")
-            W_A = gaussian_weight(CN_A, atomic_number_A, ref_i, beta_2, data)
+    if weight_method == 'gaussian':
+        for ref_i in range(N_A_ref):
+            W_A = weight(CN_A, atomic_number_A, ref_i, beta_2, data, weight_method)
             zetta_A = zeta(q_A, atomic_number_A, ref_i, data)
-            W_B = gaussian_weight(CN_B, atomic_number_B, ref_j, beta_2, data)
-            zetta_B = zeta(q_B, atomic_number_B, ref_j, data)
-            #print(f'W_A*W_B: {W_A*W_B}')
-            C6 += W_A*zetta_A*W_B*zetta_B*ref_c6
+            for ref_j in range(N_B_ref):
+                W_B = weight(CN_B, atomic_number_B, ref_j, beta_2, data, weight_method)
+                zetta_B = zeta(q_B, atomic_number_B, ref_j, data)
+
+                ref_c6 = calculate_ref_C6(atomic_number_A, ref_i, atomic_number_B, ref_j, data)
+
+                C6 += W_A*zetta_A*W_B*zetta_B*ref_c6
+    elif weight_method == 'soft_bilinear':
+        weight_factors_A = get_weight_factors(atomic_number_A, CN_A, beta_2, data)
+        weight_factors_B = get_weight_factors(atomic_number_B, CN_B, beta_2, data)
+        for ref_i in range(N_A_ref):
+            zetta_A = zeta(q_A, atomic_number_A, ref_i, data)
+            for ref_j in range(N_B_ref):
+                ref_c6 = calculate_ref_C6(atomic_number_A, ref_i, atomic_number_B, ref_j, data)
+                zetta_B = zeta(q_B, atomic_number_B, ref_j, data)
+                C6 += weight_factors_A[ref_i] * weight_factors_B[ref_j] * zetta_A * zetta_B * ref_c6
+        
     return C6
 
 def becke_johnson_damping(coords_1, coords_2, ALPHA_1, ALPHA_2, C6, C8, N):
@@ -248,7 +311,7 @@ THE DRIVER FUNCTION
 
 """
 
-def d4s_driver(nuc_types, coords, s6, s8, alpha_1, alpha_2, beta_2, s_3body, data, sec_data, r4r2):
+def d4s_driver(nuc_types, coords, s6, s8, alpha_1, alpha_2, beta_2, s_3body, data, r4r2, weight_method):
     if len(nuc_types) == 1:
         return 0, None
 
@@ -282,7 +345,7 @@ def d4s_driver(nuc_types, coords, s6, s8, alpha_1, alpha_2, beta_2, s_3body, dat
             # Pair C6 coefficient between Atoms 1 and 2
             c6_12 = calculate_C6(atom1_idx, coordination_numbers[d1], effective_charges[d1], 
                                  atom2_idx, coordination_numbers[d2+d1+1], effective_charges[d2+d1+1], 
-                                 beta_2, data)
+                                 beta_2, data, weight_method)
             
             # Pair C8 coefficient between Atoms 1 and 2
             c8_12 = calculate_C8(c6_12, atom1_idx, atom2_idx, r4r2)
@@ -290,7 +353,7 @@ def d4s_driver(nuc_types, coords, s6, s8, alpha_1, alpha_2, beta_2, s_3body, dat
             # Pair C6 coefficient for 3-body calculation
             c6_3body_list[d1][d2+d1+1] = calculate_C6(atom1_idx, coordination_numbers[d1], 0, 
                                                       atom2_idx, coordination_numbers[d2+d1+1], 0, 
-                                                      beta_2, data)
+                                                      beta_2, data, weight_method)
             # Pair C8 coefficient for 3-body calculation
             c8_3body_list[d1][d2+d1+1] = calculate_C8(c6_3body_list[d1][d2+d1+1], atom1_idx, atom2_idx, r4r2)
             energy_disp_e6 += s6*becke_johnson_damping(atom_coords_1, atom_coords_2, alpha_1, alpha_2, c6_12, 

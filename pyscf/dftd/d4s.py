@@ -91,10 +91,12 @@ FUNC_CODE = {
     #''             : ('dftb3',                  (4,)),
 }
 
-def d4s(scf_method, s6=None, s8=None, alpha1=None, alpha2=None, beta2=None, s_3body=None):
+def d4s(scf_method, s6=None, s8=None, alpha1=None, alpha2=None, beta2=None, s_3body=None,
+        weight_method='gaussian'):
     # Create the object of dftd3 interface wrapper
     xc = getattr(scf_method, 'xc', 'HF').upper().replace(' ', '')
-    with_dftd4s = DFTD4S_Model(scf_method.mol, xc, s6, s8, alpha1, alpha2, beta2, s_3body)
+    with_dftd4s = DFTD4S_Model(scf_method.mol, xc, s6, s8, alpha1, alpha2, beta2, 
+                               s_3body, weight_method)
 
     # DFT-D3 has been initialized, avoid to create the derived classes twice.
     if isinstance(scf_method, _DFTD4S):
@@ -152,7 +154,8 @@ class _DFTD4S:
 
 class DFTD4S_Model(lib.StreamObject):
     def __init__(self, mol, xc='hf', s6=None, s8=None, 
-                 alpha1=None, alpha2=None, beta2=None, s_3body=None):
+                 alpha1=None, alpha2=None, beta2=None, 
+                 s_3body=None, weight_method='gaussian'):
         self.mol = mol
         self.verbose = mol.verbose
         self.xc = xc
@@ -162,6 +165,7 @@ class DFTD4S_Model(lib.StreamObject):
         self.data = None
         self.sec_data = None
         self.disp_driver = d4s_driver
+        self.weight_method = weight_method
 
         # Translate XC functional to DFTD version
         basis_type = _get_basis_type(mol)
@@ -224,7 +228,8 @@ class DFTD4S_Model(lib.StreamObject):
 
         edisp, grads = self.disp_driver(nuc_types, coords, self.s6, self.s8, 
                                         self.a1, self.a2, self.b2, 
-                                        self.s_3body, self.data, self.sec_data, self.r4r2)
+                                        self.s_3body, self.data, self.r4r2, 
+                                        self.weight_method)
 
         self.edisp = edisp
         self.grads = grads

@@ -206,13 +206,15 @@ def zeta(q_A, atomic_number, ref_number, data):
     return zeta
 
 def get_weight_factors(atomic_number, CN_A, beta_2, data):
-    n_window = 16
+    n_window = 48
+    # Window extent: 2 sigma
+    x_window = 2.0 / numpy.sqrt(beta_2)
     n_refdata = data['refn'][atomic_number]
-    linear_window = numpy.linspace(-5, 5, num=n_window+1)
+    linear_window = numpy.linspace(-x_window, x_window, num=n_window+1)
     gaussian_window = numpy.exp(-beta_2 * linear_window * linear_window)
     gaussian_window /= numpy.sum(gaussian_window)
     CN_A_ref = numpy.array([data['refcovcn'][ref][atomic_number] for ref in range(n_refdata)])
-    
+   
     def weight_factors(cn):
         weights = numpy.zeros(CN_A_ref.shape, dtype=float)
         if cn <= numpy.min(CN_A_ref):
@@ -229,7 +231,7 @@ def get_weight_factors(atomic_number, CN_A, beta_2, data):
 
         # Find the right neighbour, i. e. smallest value bigger than cn
         mask_right = CN_A_ref > cn
-        right_cn = numpy.max(CN_A_ref[mask_right])
+        right_cn = numpy.min(CN_A_ref[mask_right])
         index_right = numpy.where(CN_A_ref == right_cn)[0][0]
 
         # Number between 0 and 1 that encodes where cn is in the interval
@@ -241,6 +243,14 @@ def get_weight_factors(atomic_number, CN_A, beta_2, data):
         return weights
 
     total_weights = numpy.zeros(CN_A_ref.shape, dtype=float)
+
+    for i, cn_i in enumerate(linear_window):
+        gweight = weight_factors(cn_i + CN_A)
+        total_weights += gweight * gaussian_window[i]
+
+    return total_weights
+
+    total_weights = numpy.zeros(CN_A_ref.shape, dtype=float)
     for i, cn_i in enumerate(linear_window):
         gweight = weight_factors(cn_i + CN_A)
         total_weights += gweight * gaussian_window[i]
@@ -249,6 +259,17 @@ def get_weight_factors(atomic_number, CN_A, beta_2, data):
 
 
 def calculate_C6(atomic_number_A, CN_A, q_A, atomic_number_B, CN_B, q_B, beta_2, data, weight_method='gaussian'):
+    # Escape concurrent evaluation of many datapoints
+    if isinstance(CN_A, tuple):
+        return tuple(calculate_C6(atomic_number_A, CN, q_A, atomic_number_B, CN_B, 
+                                  q_B, beta_2, data, weight_method) for CN in CN_A)
+    elif isinstance(CN_A, list):
+        return [calculate_C6(atomic_number_A, CN, q_A, atomic_number_B, CN_B, 
+                             q_B, beta_2, data, weight_method) for CN in CN_A]
+    elif isinstance(CN_A, numpy.ndarray):
+        return numpy.array([calculate_C6(atomic_number_A, CN, q_A, atomic_number_B, CN_B, 
+                                         q_B, beta_2, data, weight_method) for CN in CN_A])
+
     #Computes C6_AB coefficient
     N_A_ref = data['refn'][atomic_number_A]
     N_B_ref = data['refn'][atomic_number_B]
@@ -260,13 +281,13 @@ def calculate_C6(atomic_number_A, CN_A, q_A, atomic_number_B, CN_B, q_B, beta_2,
             for ref_j in range(N_B_ref):
                 W_B = weight(CN_B, atomic_number_B, ref_j, beta_2, data, weight_method)
                 zetta_B = zeta(q_B, atomic_number_B, ref_j, data)
-
                 ref_c6 = calculate_ref_C6(atomic_number_A, ref_i, atomic_number_B, ref_j, data)
-
                 C6 += W_A*zetta_A*W_B*zetta_B*ref_c6
+
     elif weight_method == 'soft_bilinear':
         weight_factors_A = get_weight_factors(atomic_number_A, CN_A, beta_2, data)
         weight_factors_B = get_weight_factors(atomic_number_B, CN_B, beta_2, data)
+
         for ref_i in range(N_A_ref):
             zetta_A = zeta(q_A, atomic_number_A, ref_i, data)
             for ref_j in range(N_B_ref):

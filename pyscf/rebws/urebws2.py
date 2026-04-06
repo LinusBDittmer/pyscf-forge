@@ -21,8 +21,8 @@ from pyscf import ao2mo, lib
 from pyscf.lib import logger
 
 
-DIIS_SPACE       = 6
-DIIS_START_CYCLE = 3
+DIIS_SPACE       = 10
+DIIS_START_CYCLE = 0
 
 
 # ---------------------------------------------------------------------------
@@ -189,7 +189,7 @@ def init_amps(urebws, eris):
     '''
     nocca, noccb = urebws.get_nocc()
     nmoa,  nmob  = urebws.get_nmo()
-    nvira, nvirb = nmoa - nocca, nmob - noccb
+
     eps_oa = eris.mo_energy[0][:nocca]
     eps_va = eris.mo_energy[0][nocca:]
     eps_ob = eris.mo_energy[1][:noccb]
@@ -221,11 +221,9 @@ def energy(urebws, t2, ovovs):
     '''
     t2aa, t2ab, t2bb = t2
     ovov, ovOV, OVOV = ovovs
-    E_aa = 0.5 * numpy.einsum('iajb,iajb->', t2aa,
-                               ovov - ovov.transpose(0, 3, 2, 1)).real
+    E_aa = 0.5 * numpy.einsum('iajb,iajb->', t2aa, ovov).real
+    E_bb = 0.5 * numpy.einsum('iajb,iajb->', t2bb, OVOV).real
     E_ab = numpy.einsum('iaJB,iaJB->', t2ab, ovOV).real
-    E_bb = 0.5 * numpy.einsum('IAJB,IAJB->', t2bb,
-                               OVOV - OVOV.transpose(0, 3, 2, 1)).real
     return E_aa + E_ab + E_bb
 
 
@@ -240,6 +238,8 @@ def _compute_H_aa(t2aa, t2ab, ovov, ovOV, eps_oa, alpha):
     H_aa = -(alpha/8)(X+X.T) + (alpha/8)(Y+Y.T) + (alpha/4)(Z+Z.T) + diag(eps_oa)
     '''
     nocca = t2aa.shape[0]
+    if nocca == 0:
+        return numpy.diag(eps_oa)
     X_aa  = numpy.einsum('iakb,jbka->ij', t2aa, ovov)
     Y_aa  = t2aa.reshape(nocca, -1) @ ovov.reshape(nocca, -1).T
     Z_ab  = t2ab.reshape(nocca, -1) @ ovOV.reshape(nocca, -1).T
@@ -260,6 +260,8 @@ def _compute_H_bb(t2bb, t2ab, OVOV, ovOV, eps_ob, alpha):
     H_bb = -(alpha/8)(X+X.T) + (alpha/8)(Y+Y.T) + (alpha/4)(Z+Z.T) + diag(eps_ob)
     '''
     noccb     = t2bb.shape[0]
+    if noccb == 0:
+        return numpy.diag(eps_ob)
     X_bb      = numpy.einsum('IAKB,JBKA->IJ', t2bb, OVOV)
     Y_bb      = t2bb.reshape(noccb, -1) @ OVOV.reshape(noccb, -1).T
     # Z_ba[I,J] = sum_{k,a,A} t2ab[k,a,I,A] * ovOV[k,a,J,A]
@@ -275,8 +277,9 @@ def _compute_H_bb(t2bb, t2ab, OVOV, ovOV, eps_ob, alpha):
 def compute_residual_aa(t2aa, t2ab, H_aa, eris, eps_va, beta):
     '''Alpha-alpha RE-BWs2 residual (the_method.md lines 60-81).
 
-    Driving terms lines 60 and 81: -(ib|ja) + (ia|jb) = ovov - ovov.T(0,3,2,1).
-    Both terms are correct as written — no sign correction needed here.
+    The driving terms (lines 60 and 81) have the same sign correction as R_ab:
+    the document writes -(ib|ja) + (ia|jb) but the correct residual sign is
+    +(ib|ja) - (ia|jb) so that R=0 at the UMP2 starting point.
 
     With antisymmetric t2aa, the H_vv terms (lines 62,64) both reduce to
     -t2aa * eps_va (see derivation in urebws2.py docstring).
@@ -289,8 +292,8 @@ def compute_residual_aa(t2aa, t2ab, H_aa, eris, eps_va, beta):
 
     R = numpy.zeros_like(t2aa)
 
-    # Driving: -(ib|ja) + (ia|jb)
-    R += ovov - ovov.transpose(0, 3, 2, 1)
+    # Driving: +(ib|ja) - (ia|jb)   (sign-corrected from the_method.md)
+    R -= ovov - ovov.transpose(0, 3, 2, 1)
 
     # H-occ (lines 61, 63)
     R += numpy.einsum('iakb,jk->iajb', t2aa, H_aa)     # +t^ab_ik H^j_k
@@ -334,8 +337,8 @@ def compute_residual_bb(t2bb, t2ab, H_bb, eris, eps_vb, beta):
 
     R = numpy.zeros_like(t2bb)
 
-    # Driving: -(IB|JA) + (IA|JB)
-    R += OVOV - OVOV.transpose(0, 3, 2, 1)
+    # Driving: +(IB|JA) - (IA|JB)   (sign-corrected from the_method.md)
+    R -= OVOV - OVOV.transpose(0, 3, 2, 1)
 
     # H-occ
     R += numpy.einsum('IAKB,JK->IAJB', t2bb, H_bb)     # +t^AB_IK H^J_K
@@ -439,6 +442,9 @@ def kernel(urebws, eris=None, verbose=None):
     D_aa  = lib.direct_sum('ia,jb->iajb', eia_a, eia_a)
     D_ab  = lib.direct_sum('ia,JB->iaJB', eia_a, eia_b)
     D_bb  = lib.direct_sum('IA,JB->IAJB', eia_b, eia_b)
+    D_aa[D_aa < 5.e-2] = 5.e-2
+    D_ab[D_ab < 5.e-2] = 5.e-2
+    D_bb[D_bb < 5.e-2] = 5.e-2
 
     # MP2 starting point
     e_corr, t2 = init_amps(urebws, eris)
@@ -471,13 +477,13 @@ def kernel(urebws, eris=None, verbose=None):
         R_ab_norm = R_ab / D_ab
         R_bb_norm = R_bb / D_bb
 
-        conv_check = max(float(numpy.max(numpy.abs(R_aa_norm))),
-                         float(numpy.max(numpy.abs(R_ab_norm))),
-                         float(numpy.max(numpy.abs(R_bb_norm))))
+        conv_check = max(float(numpy.max(numpy.abs(R_aa_norm), initial=0.0)),
+                         float(numpy.max(numpy.abs(R_ab_norm), initial=0.0)),
+                         float(numpy.max(numpy.abs(R_bb_norm), initial=0.0)))
 
-        t2aa_new = t2aa - R_aa_norm
-        t2ab_new = t2ab - R_ab_norm
-        t2bb_new = t2bb - R_bb_norm
+        t2aa_new = t2aa + R_aa_norm
+        t2ab_new = t2ab + R_ab_norm
+        t2bb_new = t2bb + R_bb_norm
 
         if cycle >= urebws.diis_start_cycle:
             t2aa_new = adiis_aa.update(

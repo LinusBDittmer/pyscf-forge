@@ -75,9 +75,14 @@ def kernel(bws, mo_energy=None, mo_coeff=None, eris=None, verbose=None):
         # 4. Dressed amplitudes: t_ij^ab = (ia|jb)_dressed / Delta_ij^ab
         #    Delta[i,a,j,b] = eps_occ_dressed[i] + eps_occ_dressed[j]
         #                     - eps_vir[a] - eps_vir[b]  (negative)
-        eia = eps_occ_dressed[:, None] - eps_vir[None, :]   # (nocc, nvir)
-        Dij = lib.direct_sum('ia,jb->iajb', eia, eia)
-        t2  = ovov / Dij
+        #    Linear mixing (t2_damp) stabilises oscillating iterations that
+        #    arise when the HOMO-LUMO gap is near zero (e.g. stretched bonds).
+        #    The fixed point is unchanged; the damped-iteration eigenvalue at
+        #    the fixed point is (1-2*t2_damp), which is 0 for t2_damp=0.5.
+        eia    = eps_occ_dressed[:, None] - eps_vir[None, :]   # (nocc, nvir)
+        Dij    = lib.direct_sum('ia,jb->iajb', eia, eia)
+        t2_new = ovov / Dij
+        t2     = (1.0 - bws.t2_damp) * t2 + bws.t2_damp * t2_new
 
         # 5. BW-s2 correlation energy
         e_corr = energy(bws, t2, ovov)
@@ -395,9 +400,12 @@ class BWSBase(lib.StreamObject):
     max_cycle = 50
     conv_tol  = 1e-7
     alpha     = 1.0   # W scaling: M = F_oo + (alpha/2)*W; alpha=1 -> BW-s2, alpha=0 -> MP2
+    t2_damp   = 1.0   # linear mixing for amplitude update (0<damp<=1).  The default
+                      # (1.0 = full update, no mixing) preserves the original iteration.
+                      # Set to 0.5 to prevent oscillation near degenerate denominators.
 
     _keys = {
-        'max_cycle', 'conv_tol', 'alpha', 'mol', 'max_memory',
+        'max_cycle', 'conv_tol', 'alpha', 't2_damp', 'mol', 'max_memory',
         'mo_coeff', 'mo_occ', 'e_hf', 'e_corr', 't2',
     }
 
@@ -455,8 +463,8 @@ class BWSBase(lib.StreamObject):
         log.info('')
         log.info('******** %s ********', self.__class__)
         log.info('nocc = %s, nmo = %s', self.nocc, self.nmo)
-        log.info('max_cycle = %d  conv_tol = %g  alpha = %g',
-                 self.max_cycle, self.conv_tol, self.alpha)
+        log.info('max_cycle = %d  conv_tol = %g  alpha = %g  t2_damp = %g',
+                 self.max_cycle, self.conv_tol, self.alpha, self.t2_damp)
         log.info('max_memory %d MB (current use %d MB)',
                  self.max_memory, lib.current_memory()[0])
         return self

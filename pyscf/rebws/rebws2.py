@@ -19,8 +19,8 @@ import numpy
 from pyscf import ao2mo, lib
 from pyscf.lib import logger
 
-DIIS_SPACE       = 15
-DIIS_START_CYCLE = 2
+DIIS_SPACE       = 10
+DIIS_START_CYCLE = 0
 
 
 # ---------------------------------------------------------------------------
@@ -163,7 +163,6 @@ def init_amps(rebws, eris):
     t2 : ndarray, shape (nocc, nvir, nocc, nvir)
     '''
     nocc    = rebws.nocc
-    nvir    = rebws.nmo - nocc
     eps_occ = eris.mo_energy[:nocc]
     eps_vir = eris.mo_energy[nocc:]
     eia     = eps_occ[:, None] - eps_vir[None, :]       # (nocc, nvir), negative
@@ -185,20 +184,23 @@ def energy(rebws, t2, ovov):
 def _compute_H_ij(t2, ovov, eps_occ, alpha):
     '''Build the (nocc, nocc) H intermediate (restricted, canonical).
 
-    Derived by setting all beta-spin indices to alpha in H^i_j and
-    combining same-spin (coeff alpha/8) and opposite-spin (coeff alpha/4)
-    terms. Reduces to diag(eps_occ) at alpha=0. H is symmetric.
+    Derived by restricting the unrestricted H^alpha_ij to closed-shell.
+    In the unrestricted formulation, H_aa has three contributions:
+        - same-spin X_aa/Y_aa terms (coeff alpha/8) using antisymmetric t2aa
+        - opposite-spin Z_ab term (coeff alpha/4) using t2ab = t2_R
+
+    Substituting t2aa = t2_R - t2_R.T_0321 and t2ab = t2_R at closed shell,
+    X_aa = X - Y, Y_aa = Y - X, Z_ab = Y (where X, Y use t2_R), and the
+    combined result is:
 
     Let:
         X[i,j] = sum_{k,a,b} t2[i,a,k,b] * ovov[j,b,k,a]   (jb|ka) in chemist notation
         Y[i,j] = sum_{k,a,b} t2[i,a,k,b] * ovov[j,a,k,b]   (ja|kb)
 
     Then:
-        H = -(alpha/8)*(X + X.T) + (3*alpha/8)*(Y + Y.T) + diag(eps_occ)
+        H = -(alpha/4)*(X + X.T) + (alpha/2)*(Y + Y.T) + diag(eps_occ)
 
-    The 3/8 prefactor on Y comes from merging:
-        same-spin coefficient   alpha/8  (from the alpha-alpha block)
-        opposite-spin coefficient alpha/4  (from the alpha-beta block, restricted)
+    Reduces to diag(eps_occ) at alpha=0. H is symmetric.
     '''
     nocc = t2.shape[0]
     # X[i,j] = sum_{k,a,b} t2[i,a,k,b] * ovov[j,b,k,a]
@@ -206,8 +208,8 @@ def _compute_H_ij(t2, ovov, eps_occ, alpha):
     # Y[i,j] = sum_{k,a,b} t2[i,a,k,b] * ovov[j,a,k,b]
     # Written as a matrix multiply over the flattened (a,k,b) dimension.
     Y = t2.reshape(nocc, -1) @ ovov.reshape(nocc, -1).T
-    H = (-(alpha / 8.0) * (X + X.T)
-         + (3.0 * alpha / 8.0) * (Y + Y.T)
+    H = (-(alpha / 4.0) * (X + X.T)
+         + (alpha / 2.0) * (Y + Y.T)
          + numpy.diag(eps_occ))
     return H
 
@@ -273,6 +275,13 @@ def compute_residual(t2, H, eris, eps_vir, alpha, beta):
         R -= beta * numpy.einsum('kcjb,iakc->iajb', t2, ovov)
         # L14: -beta * sum_{c,d} t2[i,c,j,d] * vvvv[a,c,b,d]   (ac|bd)
         R -= beta * numpy.einsum('icjd,acbd->iajb', t2, vvvv)
+        # M1/M2: antisymmetry corrections from t2aa/t2bb in the opposite-spin residual.
+        # In the unrestricted R_ab, L10 uses antisymmetric t2aa and L12 uses antisymmetric
+        # t2bb.  At closed shell, the extra terms from antisymmetrisation are:
+        #   M1 from L10:  +beta * sum_{k,c} t2[i,c,k,a] * ovov[j,b,k,c]
+        #   M2 from L12:  +beta * sum_{k,c} t2[j,c,k,b] * ovov[i,a,k,c]
+        R += beta * numpy.einsum('icka,jbkc->iajb', t2, ovov)
+        R += beta * numpy.einsum('jckb,iakc->iajb', t2, ovov)
 
     # L15: driving term — NEGATIVE sign (corrected from the_method.md)
     R -= ovov
@@ -311,6 +320,7 @@ def kernel(rebws, eris=None, verbose=None):
     # Delta_eps[i,a,j,b] = (eps_a - eps_i) + (eps_b - eps_j)  > 0
     eia = eps_vir[None, :] - eps_occ[:, None]       # (nocc, nvir), positive
     Dab = lib.direct_sum('ia,jb->iajb', eia, eia)   # (nocc, nvir, nocc, nvir), positive
+    Dab[Dab < 5.e-2] = 5.e-2
 
     # Iteration 0: MP2 starting point
     e_corr, t2 = init_amps(rebws, eris)

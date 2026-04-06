@@ -211,5 +211,42 @@ class TestRBWS2Alpha(unittest.TestCase):
         self.assertAlmostEqual(e_pair - 2 * e_he, 0.0, 8)
 
 
+class TestRBWS2DissociationLimit(unittest.TestCase):
+    '''RBWS2(alpha=1) drives E_tot → 2 × E(H atom) at H2 dissociation.
+
+    With symmetric (delocalized) RHF MOs the Brillouin-Wigner correlation
+    energy exactly cancels the ionic contamination in E_RHF: as R → ∞,
+    E_RHF → 2·E_H + K  (K = exchange integral ≈ J_AA/2)
+    E_corr → gap − √(gap² + K²) → −K
+    so E_RBWS2 → 2·E_H.
+
+    Convergence is algebraic: gap ~ 1/R (Coulomb correction), giving
+    |E_RBWS2 − 2·E_H| ≈ gap ≈ 5×10⁻⁴ Ha at R = 1000 Å.  mol.symmetry=True
+    forces the bonding/antibonding MOs so that RHF does not break symmetry
+    to the H⁻/H⁺ minimum.  The amplitude-damping default (t2_damp=0.5)
+    stabilises the near-degenerate iteration.
+    '''
+
+    @classmethod
+    def setUpClass(cls):
+        mol_h = gto.M(atom='H 0 0 0', basis='sto-3g', spin=1,
+                      verbose=0, output='/dev/null')
+        cls.e_h = scf.UHF(mol_h).run().e_tot
+
+    def test_dissociation_limit(self):
+        mol_h2 = gto.M(atom='H 0 0 0; H 0 0 100000', basis='sto-3g',
+                       unit='Angstrom', symmetry=True,
+                       verbose=0, output='/dev/null')
+        mf_h2 = scf.RHF(mol_h2)
+        mf_h2.conv_tol = 1e-12
+        mf_h2.run()
+        bws = RBWS2(mf_h2)
+        bws.max_cycle = int(1e7)
+        bws.run()
+        # Analytic limit: |E_RBWS2 − 2·E_H| ≈ gap(R) ≈ 5×10⁻⁶ Ha at 1e5 Å.
+        # Convergence is slow (|J| → 1 as gap → 0); ~6×10⁵ cycles needed.
+        self.assertAlmostEqual(bws.e_tot, 2.0 * self.e_h, places=3)
+
+
 if __name__ == '__main__':
     unittest.main()

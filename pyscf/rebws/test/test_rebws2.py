@@ -254,7 +254,6 @@ class TestResidual(unittest.TestCase):
         R_act = compute_residual(self.t2_mp2, H, self.eris, self.eps_vir,
                                  alpha=0.0, beta=0.0)
         # Build expected residual explicitly
-        nocc, nvir = self.nocc, self.nvir
         eia = lib.direct_sum('i,a->ia', self.eps_occ, -self.eps_vir)   # negative
         Dij = lib.direct_sum('ia,jb->iajb', eia, eia)                  # negative
         R_exp = Dij * self.t2_mp2 - self.ovov
@@ -267,13 +266,11 @@ class TestResidual(unittest.TestCase):
                               alpha=1.0, beta=0.0)
         R1 = compute_residual(self.t2_mp2, H, self.eris, self.eps_vir,
                               alpha=1.0, beta=1.0)
-        # Spot-check: diff must equal L5 term (among others)
-        t2   = self.t2_mp2
-        oovv = numpy.asarray(self.eris.oovv)
-        L5   = numpy.einsum('iakc,jkbc->iajb', t2, oovv)
         diff = R1 - R0
-        # diff contains L5..L14; L5 alone must be a sub-component
-        # Verify that R(beta=0.5) = (R(beta=0) + R(beta=1)) / 2
+        # Beta terms must be non-trivially large
+        self.assertGreater(numpy.max(numpy.abs(diff)), 1e-10,
+                           msg='beta terms should be non-zero')
+        # Residual must scale linearly with beta: R(0.5) = (R(0) + R(1)) / 2
         R05 = compute_residual(self.t2_mp2, H, self.eris, self.eps_vir,
                                alpha=1.0, beta=0.5)
         numpy.testing.assert_allclose(R05, 0.5 * (R0 + R1), atol=1e-12)

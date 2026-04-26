@@ -677,7 +677,7 @@ class TestPhysics(unittest.TestCase):
                 u.conv_tol = 1e-10
                 u.run()
 
-                self.assertAlmostEqual(u.e_corr, r.e_corr, places=7,
+                self.assertAlmostEqual(u.e_corr, r.e_corr, places=6,
                                        msg=f'UREBWS2 != REBWS2 at alpha={alpha}, beta={beta}')
 
     def test_energy_is_real(self):

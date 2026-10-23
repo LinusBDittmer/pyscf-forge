@@ -33,6 +33,46 @@ def tearDownModule():
     global mol, mf_hf, mf_ks, mf_pbe
     del mol, mf_hf, mf_ks, mf_pbe
 
+def _config_ids(blocks, nC, nV):
+    '''Spatial-configuration id of every CSF (as in the dense prototype).'''
+    keys = []
+    for cl, nm, (a, b) in blocks:
+        if cl == "OO":
+            keys += [nm if nm in ("G", "D") else "OO"]
+        elif cl == "CO":
+            keys += [("CO", nm[-4:], i) for i in range(nC)]
+        elif cl == "OV":
+            keys += [("OV", nm[-4:], c) for c in range(nV)]
+        else:
+            tag = nm[-4:] if "^2" in nm else "open"
+            keys += [("CV", tag, i, c) for i in range(nC) for c in range(nV)]
+    uniq = {k: n for n, k in enumerate(dict.fromkeys(keys))}
+    return np.array([uniq[k] for k in keys])
+
+def _dense(td, spin, damping=None):
+    '''Dense <K|H-E0|L> from _blocks.py with the module's DF integrals; noCVCV damping.'''
+    ints = td._ints
+    nC, nV = ints.nC, ints.nV
+    blocks = sfxtda.csf_list(spin, nC, nV)
+    off = np.cumsum([0] + [r * c for _, _, (r, c) in blocks])
+    M = np.zeros((off[-1], off[-1]))
+    ints.allow_4index = True
+    for x, (A, na, (ni, nai)) in enumerate(blocks):
+        for y, (B, nb, (nj, nbj)) in enumerate(blocks):
+            if (A, na, B, nb) in BLOCKS:
+                args, f = BLOCKS[(A, na, B, nb)]
+                blk = np.broadcast_to(f(*[ints.value(a) for a in args]), (ni, nai, nj, nbj))
+                M[off[x]:off[x+1], off[y]:off[y+1]] = blk.reshape(ni*nai, nj*nbj)
+                M[off[y]:off[y+1], off[x]:off[x+1]] = blk.reshape(ni*nai, nj*nbj).T
+    ints.allow_4index = False
+    if damping is not None:
+        cid = _config_ids(blocks, nC, nV)
+        cv = np.concatenate([np.full(r * c, cl == 'CV') for cl, _, (r, c) in blocks])
+        d = M.diagonal().copy()
+        fac = damping[0] * np.exp(-damping[1] * (d[:, None] - d[None, :])**4)
+        M *= np.where((cid[:, None] != cid[None, :]) & ~(cv[:, None] & cv[None, :]), fac, 1.)
+    return M
+
 class KnownValues(unittest.TestCase):
     def test_reference(self):
         for mf, ch in ((mf_hf, 1.0), (mf_ks, 0.5), (mf_pbe, 0.0)):
@@ -71,6 +111,27 @@ class KnownValues(unittest.TestCase):
         self.assertAlmostEqual(abs(fjb[0, 0] - ints.fbar[np.ix_(ints.core, ints.virt)]).max(), 0, 14)
         with self.assertRaises(RuntimeError):
             ints.value('(ia|jb)')
+
+    def test_explicit_blocks(self):
+        for mf in (mf_hf, mf_ks):
+            td = sfxtda.SFXTDA(mf).build()
+            ints = td._ints
+            for spin in (0, 1, 2):
+                M = _dense(td, spin)
+                hss, hsl = sfxtda.build_small(ints, spin)
+                ns = hss.shape[0]
+                self.assertEqual(ns, {0: 3 + 2*3 + 2*8, 1: 1 + 2*3 + 2*8, 2: 0}[spin])
+                self.assertAlmostEqual(abs(hss - M[:ns, :ns]).max(initial=0), 0, 12)
+                self.assertAlmostEqual(abs(hsl - M[:ns, ns:]).max(initial=0), 0, 12)
+                lc, rv, cj, ck = sfxtda.cvcv_operator(ints, spin)
+                self.assertAlmostEqual(abs(lc - lc.T).max(), 0, 12)
+                self.assertAlmostEqual(abs(rv - rv.T).max(), 0, 12)
+                hd = sfxtda.hdiag_large(ints, lc, rv, cj, ck)
+                self.assertAlmostEqual(abs(hd.ravel() - M.diagonal()[ns:]).max(), 0, 12)
+
+    def test_3oo_diagonal_zero(self):
+        hss, _ = sfxtda.build_small(sfxtda.SFXTDA(mf_ks).build()._ints, 1)
+        self.assertAlmostEqual(hss[0, 0], 0, 12)   # 3OO is the first S=1 CSF
 
 if __name__ == "__main__":
     print("Full Tests for SF-XTDA")

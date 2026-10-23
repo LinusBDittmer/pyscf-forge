@@ -32,6 +32,7 @@ import numpy
 from pyscf import lib, scf, dft, df
 from pyscf.ao2mo import _ao2mo
 from pyscf.lib import logger
+from pyscf.sfxtda._blocks import BLOCKS, ORDER, CSF_INFO
 
 # axis of each C/V label in the broadcast shape (bra i, bra a, ket j, ket b)
 _AX = {'i': 0, 'a': 1, 'j': 2, 'b': 3}
@@ -145,6 +146,115 @@ class _DFInts:
         if len(idx) <= 2:
             self._cache[name] = arr
         return arr
+
+
+def csf_list(spin, nC, nV):
+    '''CSF types of total spin S in the fixed order (OO, CO, OV, CV) with their (rows, cols) shape.'''
+    out = []
+    for cl in ORDER:
+        names, spins = CSF_INFO[cl]
+        for nm, s in zip(names, spins):
+            if s == spin:
+                out.append((cl, nm, {'OO': (1, 1), 'CO': (nC, 1), 'OV': (1, nV), 'CV': (nC, nV)}[cl]))
+    return out
+
+
+def _split(spin, nC, nV):
+    blocks = csf_list(spin, nC, nV)
+    return [b for b in blocks if b[0] != 'CV'], [b for b in blocks if b[0] == 'CV']
+
+
+def build_small(ints, spin):
+    '''Explicit blocks <small|H-E0|small> (n_small, n_small) and <small|H-E0|CV> (n_small, nblk*nC*nV).
+
+    Every formula touching an OO/CO/OV CSF has at most three free C/V indices, so each evaluated
+    block is at most max(nC, nV) x nC*nV.
+    '''
+    nC, nV = ints.nC, ints.nV
+    nCV = nC * nV
+    small, large = _split(spin, nC, nV)
+    soff = numpy.cumsum([0] + [r * c for _, _, (r, c) in small])
+    hss = numpy.zeros((soff[-1], soff[-1]))
+    hsl = numpy.zeros((soff[-1], len(large) * nCV))
+    for x, (A, na, (ni, nai)) in enumerate(small):
+        rows = slice(soff[x], soff[x+1])
+        for y, (B, nb, (nj, nbj)) in enumerate(small + large):
+            if (A, na, B, nb) not in BLOCKS:
+                continue
+            args, f = BLOCKS[(A, na, B, nb)]
+            blk = numpy.broadcast_to(f(*[ints.value(a) for a in args]), (ni, nai, nj, nbj))
+            blk = blk.reshape(ni * nai, nj * nbj)
+            if B == 'CV':
+                q = y - len(small)
+                hsl[rows, q*nCV:(q+1)*nCV] = blk
+            else:
+                cols = slice(soff[y], soff[y+1])
+                hss[rows, cols] = blk
+                hss[cols, rows] = blk.T
+    return hss, hsl
+
+
+def cvcv_operator(ints, spin):
+    '''Decompose the CV-CV formulas into one-index operators and J/K coefficients.
+
+    Every CV-CV term is c*s*delta_ij*delta_ab, c*X_ij*delta_ab, c*Y_ab*delta_ij, c*[ia|jb] or c*[ij|ab].
+    The coefficient c of an argument is found by probing the formula (deltas = 1, that argument = 1,
+    all others = 0).  Returns the bra-ket matrices lc (nblk*nC, nblk*nC) and rv (nblk*nV, nblk*nV)
+    and the J/K coefficient matrices cj, ck (nblk, nblk).
+    '''
+    nC, nV = ints.nC, ints.nV
+    large = [nm for cl, nm, _ in csf_list(spin, nC, nV) if cl == 'CV']
+    nblk = len(large)
+    lc = numpy.zeros((nblk, nC, nblk, nC))
+    rv = numpy.zeros((nblk, nV, nblk, nV))
+    cj = numpy.zeros((nblk, nblk))
+    ck = numpy.zeros((nblk, nblk))
+    for p, na in enumerate(large):
+        for q, nb in enumerate(large):
+            if ('CV', na, 'CV', nb) not in BLOCKS:
+                continue
+            args, f = BLOCKS[('CV', na, 'CV', nb)]
+            for name in args:
+                if name.startswith('delta'):
+                    continue
+                c = f(*[1. if a.startswith('delta') else float(a == name) for a in args])
+                if name == '(ia|jb)':
+                    cj[p, q] += c
+                    continue
+                if name == '(ij|ab)':
+                    ck[p, q] += c
+                    continue
+                v = ints.value(name)
+                free = {lab for lab in _labels(name[2:] if name.startswith('F_') else name[1:-1].replace('|', ''))
+                        if lab in _AX}
+                if not free:
+                    mat, blk = lc, c * v.item() * numpy.eye(nC)
+                elif free == {'i', 'j'}:
+                    mat, blk = lc, c * v.reshape(nC, nC)
+                elif free == {'a', 'b'}:
+                    mat, blk = rv, c * v.reshape(nV, nV)
+                else:
+                    raise RuntimeError(f'unexpected CV-CV argument {name}')
+                mat[p, :, q, :] += blk
+                if p != q:
+                    mat[q, :, p, :] += blk.T
+            if p != q:
+                cj[q, p] = cj[p, q]
+                ck[q, p] = ck[p, q]
+    return lc.reshape(nblk * nC, -1), rv.reshape(nblk * nV, -1), cj, ck
+
+
+def hdiag_large(ints, lc, rv, cj, ck):
+    '''Exact diagonal of the CV-CV block, shape (nblk, nC, nV).'''
+    nC, nV = ints.nC, ints.nV
+    nblk = cj.shape[0]
+    r = numpy.arange(nblk)
+    dlc = lc.reshape(nblk, nC, nblk, nC)[r, :, r, :].diagonal(0, 1, 2)
+    drv = rv.reshape(nblk, nV, nblk, nV)[r, :, r, :].diagonal(0, 1, 2)
+    jd = numpy.einsum('Lia,Lia->ia', ints.bcv, ints.bcv)
+    kd = ints.bcc.diagonal(0, 1, 2).T @ ints.bvv.diagonal(0, 1, 2)
+    return (dlc[:, :, None] + drv[:, None, :]
+            + cj.diagonal()[:, None, None] * jd + ck.diagonal()[:, None, None] * kd)
 
 
 class SFXTDA(lib.StreamObject):

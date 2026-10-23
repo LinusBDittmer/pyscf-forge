@@ -284,23 +284,25 @@ def hdiag_large(ints, lc, rv, cj, ck):
     r = numpy.arange(nblk)
     dlc = lc.reshape(nblk, nC, nblk, nC)[r, :, r, :].diagonal(0, 1, 2)
     drv = rv.reshape(nblk, nV, nblk, nV)[r, :, r, :].diagonal(0, 1, 2)
-    jd = numpy.einsum('Lia,Lia->ia', ints.bcv, ints.bcv)
-    kd = ints.bcc.diagonal(0, 1, 2).T @ ints.bvv.diagonal(0, 1, 2)
+    jd = numpy.einsum('L,Lia,Lia->ia', ints.sign, ints.bcv, ints.bcv)
+    kd = (ints.sign[:, None] * ints.bcc.diagonal(0, 1, 2)).T @ ints.bvv.diagonal(0, 1, 2)
     return (dlc[:, :, None] + drv[:, None, :]
             + cj.diagonal()[:, None, None] * jd + ck.diagonal()[:, None, None] * kd)
 
 
 def j_contract(ints, t):
-    '''J[T]_ia = sum_jb [ia|jb] T_jb for t of shape (m, nC, nV).'''
+    '''J[T]_ia = sum_jb [ia|jb] T_jb = sum_L B^L_ia s_L rho_L for t of shape (m, nC, nV).'''
     naux = ints.naux
     rho = numpy.tensordot(t, ints.bcv, axes=([1, 2], [1, 2]))
+    rho *= ints.sign
     return lib.dot(rho, ints.bcv.reshape(naux, -1)).reshape(t.shape)
 
 
 def k_contract(ints, t):
-    '''K[T]_ia = sum_jb [ij|ab] T_jb = sum_L (B^L_CC T B^L_VV)_ia for one t of shape (nC, nV).'''
+    '''K[T]_ia = sum_jb [ij|ab] T_jb = sum_L s_L (B^L_CC T B^L_VV)_ia for one t of shape (nC, nV).'''
     naux, nC, nV = ints.bcv.shape
     x = lib.dot(ints.bcc.reshape(naux * nC, nC), t).reshape(naux, nC, nV)
+    x *= ints.sign[:, None, None]
     x = x.transpose(1, 0, 2).reshape(nC, naux * nV)
     return lib.dot(x, ints.bvv.reshape(naux * nV, nV))
 

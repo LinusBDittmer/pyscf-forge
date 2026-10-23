@@ -28,6 +28,7 @@ blocks that touch an OO/CO/OV CSF are stored explicitly (at most N^3), the CV-CV
 as a sigma vector through one-index operators and DF J/K contractions.
 '''
 
+import contextlib
 import numpy
 from pyscf import lib, scf, dft, df, symm
 from pyscf.ao2mo import _ao2mo
@@ -42,7 +43,8 @@ _SPACE = {'i': 'C', 'j': 'C', 'a': 'V', 'b': 'V', 'O1': 'O1', 'O2': 'O2'}
 
 
 def _reference(mf):
-    '''Orbital partition, spin-averaged KS Fock matrix (MO basis) and exact-exchange fraction.'''
+    '''Orbital partition, spin-averaged KS Fock matrix (MO basis) and the exact-exchange kernel
+    coefficients (omega, alpha, hyb) of PySCF: w(r) = hyb/r + (alpha - hyb) erf(omega r)/r.'''
     if not isinstance(mf, scf.rohf.ROHF):
         raise TypeError('SF-XTDA requires a ROHF or ROKS reference')
     mol = mf.mol
@@ -55,15 +57,30 @@ def _reference(mf):
     if not mf.converged:
         raise RuntimeError('reference SCF not converged')
     if isinstance(mf, dft.rks.KohnShamDFT):
-        omega, alpha, c_h = mf._numint.rsh_and_hybrid_coeff(mf.xc, mol.spin)
-        if abs(omega) > 1e-12:
-            raise NotImplementedError('range-separated hybrids')
+        xc_coeffs = tuple(mf._numint.rsh_and_hybrid_coeff(mf.xc, mol.spin))
     else:
-        c_h = 1.
+        xc_coeffs = (0., 1., 1.)
     mo_coeff = mf.mo_coeff
     f = mf.get_fock()
     fbar = .5 * mo_coeff.T @ (f.focka + f.fockb) @ mo_coeff
-    return mo_coeff, core, somo, virt, fbar, c_h
+    return mo_coeff, core, somo, virt, fbar, xc_coeffs
+
+
+def _kernel_terms(omega, alpha, hyb):
+    '''DF terms [(c_t, omega_t)] of w, following the branches of pyscf.dft.rks.get_veff.
+
+    omega_t = 0: full Coulomb, > 0: erf (long range), < 0: erfc (short range).  Terms with
+    c_t = 0 are dropped, so a pure functional has no term.
+    '''
+    if omega == 0:
+        terms = [(hyb, 0.)]
+    elif alpha == 0:
+        terms = [(hyb, -omega)]
+    elif hyb == 0:
+        terms = [(alpha, omega)]
+    else:
+        terms = [(hyb, 0.), (alpha - hyb, omega)]
+    return [(float(c), float(o)) for c, o in terms if c != 0]
 
 
 def _labels(s):
@@ -79,16 +96,21 @@ def _labels(s):
 
 
 class _DFInts:
-    '''Fock elements and c_H-scaled DF integrals as arrays broadcastable to (nC, nV, nC, nV).
+    '''Fock elements and DF integrals of the kernel w as arrays broadcastable to (nC, nV, nC, nV).
 
-    The three-index factors are scaled by sqrt(c_H), so [pq|rs] = sum_L B^L_pq B^L_rs.
+    The fits of all kernel terms (c_t, omega_t) are stacked along L, each scaled by sqrt|c_t|, with
+    sign s_L = sign(c_t), so [pq|rs] = sum_L s_L B^L_pq B^L_rs.
     Integrals with four free C/V indices (N^4) are refused unless allow_4index is set (tests only).
-    For c_H = 0 (pure functionals) every two-electron integral vanishes and no DF tensor is built
+    For a pure functional (no term) every two-electron integral vanishes and no DF tensor is built
     (naux = 0).
     '''
-    def __init__(self, with_df, mo_coeff, core, somo, virt, fbar, c_h):
+    def __init__(self, with_df, mo_coeff, core, somo, virt, fbar, terms):
         nmo = mo_coeff.shape[1]
-        naux = with_df.get_naoaux() if c_h != 0 else 0
+        sizes = []
+        for c, o in terms:
+            with (contextlib.nullcontext(with_df) if o == 0 else with_df.range_coulomb(o)) as d:
+                sizes.append(d.get_naoaux())
+        naux = sum(sizes)
         self.core, self.somo, self.virt, self.fbar = core, somo, virt, fbar
         nC, nV = len(core), len(virt)
         self.nC, self.nV, self.naux = nC, nV, naux
@@ -99,18 +121,25 @@ class _DFInts:
         self.bcv = numpy.empty((naux, nC, nV))
         self.bvv = numpy.empty((naux, nV, nV))
         self.bo = numpy.empty((naux, 2, nmo))
+        self.sign = numpy.empty(naux)
         mo = numpy.asarray(mo_coeff, order='F')
         p1 = 0
-        for eri1 in (with_df.loop() if naux else ()):
-            p0, p1 = p1, p1 + eri1.shape[0]
-            buf = _ao2mo.nr_e2(eri1, mo, (0, nmo, 0, nmo), aosym='s2', mosym='s1').reshape(-1, nmo, nmo)
-            self.bcc[p0:p1] = buf[:, core[:, None], core]
-            self.bcv[p0:p1] = buf[:, core[:, None], virt]
-            self.bvv[p0:p1] = buf[:, virt[:, None], virt]
-            self.bo[p0:p1] = buf[:, somo]
-        scale = numpy.sqrt(c_h)
-        for b in (self.bcc, self.bcv, self.bvv, self.bo):
-            b *= scale
+        for (c, o), n in zip(terms, sizes):
+            t0 = p1
+            # mol.omega is only restored on leaving the context: consume the loop inside it
+            with (contextlib.nullcontext(with_df) if o == 0 else with_df.range_coulomb(o)) as d:
+                for eri1 in d.loop():
+                    p0, p1 = p1, p1 + eri1.shape[0]
+                    buf = _ao2mo.nr_e2(eri1, mo, (0, nmo, 0, nmo), aosym='s2', mosym='s1').reshape(-1, nmo, nmo)
+                    self.bcc[p0:p1] = buf[:, core[:, None], core]
+                    self.bcv[p0:p1] = buf[:, core[:, None], virt]
+                    self.bvv[p0:p1] = buf[:, virt[:, None], virt]
+                    self.bo[p0:p1] = buf[:, somo]
+            assert p1 - t0 == n
+            scale = numpy.sqrt(abs(c))
+            for b in (self.bcc, self.bcv, self.bvv, self.bo):
+                b[t0:p1] *= scale
+            self.sign[t0:p1] = numpy.sign(c)
 
     def _b(self, p, q):
         '''Three-index factor (naux, n_p, n_q) for the label pair (p, q).'''
@@ -137,7 +166,7 @@ class _DFInts:
             labs = _labels(left) + _labels(right)
             if not self.allow_4index and all(lab in _AX for lab in labs):
                 raise RuntimeError(f'N^4 integral {name} requested')
-            arr = numpy.tensordot(self._b(*labs[:2]), self._b(*labs[2:]), axes=(0, 0))
+            arr = numpy.tensordot(self.sign[:, None, None] * self._b(*labs[:2]), self._b(*labs[2:]), axes=(0, 0))
         idx = [k for k, lab in enumerate(labs) if lab in _AX]
         lab_idx = [labs[k] for k in idx]
         arr = arr.reshape([arr.shape[k] for k in idx])
@@ -368,19 +397,20 @@ class SFXTDA(lib.StreamObject):
     def build(self):
         log = logger.new_logger(self)
         mf = self._scf
-        mo_coeff, core, somo, virt, fbar, c_h = _reference(mf)
+        mo_coeff, core, somo, virt, fbar, xc_coeffs = _reference(mf)
         with_df = getattr(mf, 'with_df', None)
         if with_df is None:
             log.warn('Reference SCF is not density fitted: F^KS uses exact J/K, '
                      'the response integrals use df.DF(auxbasis=%s)', self.auxbasis)
             with_df = df.DF(self.mol, auxbasis=self.auxbasis)
             with_df.max_memory = self.max_memory
-        self._ints = ints = _DFInts(with_df, mo_coeff, core, somo, virt, fbar, c_h)
+        terms = _kernel_terms(*xc_coeffs)
+        self._ints = ints = _DFInts(with_df, mo_coeff, core, somo, virt, fbar, terms)
         self._orbs = (core, somo, virt)
-        self.c_h = c_h
+        self.xc_coeffs = xc_coeffs
         mem = sum(b.nbytes for b in (ints.bcc, ints.bcv, ints.bvv, ints.bo)) / 1e6
-        log.info('SF-XTDA: nC = %d  nV = %d  naux = %d  c_H = %g  DF tensors %.1f MB',
-                 ints.nC, ints.nV, ints.naux, c_h, mem)
+        log.info('SF-XTDA: nC = %d  nV = %d  naux = %d  omega = %g  alpha = %g  hyb = %g  DF tensors %.1f MB',
+                 ints.nC, ints.nV, ints.naux, *xc_coeffs, mem)
         if mem > self.max_memory:
             log.warn('DF tensors (%.1f MB) exceed max_memory (%d MB)', mem, self.max_memory)
         return self

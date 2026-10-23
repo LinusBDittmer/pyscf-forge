@@ -23,15 +23,20 @@ from pyscf.sfxtda._blocks import BLOCKS
 CH2 = "C 0 0 0; H 0.1 1.0 0.5; H -0.2 -0.95 0.35"
 
 def setUpModule():
-    global mol, mf_hf, mf_ks, mf_pbe
+    global mol, mf_hf, mf_ks, mf_pbe, mf_cam, mf_lc, mf_hse, mf_neg
     mol = gto.M(atom=CH2, basis='6-31g', spin=2, verbose=0)
     mf_hf = scf.ROHF(mol).density_fit().run(conv_tol=1e-11)
     mf_ks = dft.ROKS(mol, xc='BHANDHLYP').density_fit().run(conv_tol=1e-11)
     mf_pbe = dft.ROKS(mol, xc='PBE').density_fit().run(conv_tol=1e-11)
+    mf_cam = dft.ROKS(mol, xc='CAM-B3LYP').density_fit().run(conv_tol=1e-11)
+    mf_lc = dft.ROKS(mol, xc='LRC-wPBE').density_fit().run(conv_tol=1e-11)        # hyb = 0
+    mf_hse = dft.ROKS(mol, xc='HSE06').density_fit().run(conv_tol=1e-11)          # alpha = 0, erfc
+    # alpha < hyb: negative long-range coefficient
+    mf_neg = dft.ROKS(mol, xc='0.3*SR_HF(0.3)+0.1*LR_HF(0.3)+0.7*B88,LYP').density_fit().run(conv_tol=1e-11)
 
 def tearDownModule():
-    global mol, mf_hf, mf_ks, mf_pbe
-    del mol, mf_hf, mf_ks, mf_pbe
+    global mol, mf_hf, mf_ks, mf_pbe, mf_cam, mf_lc, mf_hse, mf_neg
+    del mol, mf_hf, mf_ks, mf_pbe, mf_cam, mf_lc, mf_hse, mf_neg
 
 def _config_ids(blocks, nC, nV):
     '''Spatial-configuration id of every CSF (as in the dense prototype).'''
@@ -75,17 +80,16 @@ def _dense(td, spin, damping=None):
 
 class KnownValues(unittest.TestCase):
     def test_reference(self):
-        for mf, ch in ((mf_hf, 1.0), (mf_ks, 0.5), (mf_pbe, 0.0)):
-            C, core, somo, virt, fbar, c_h = sfxtda._reference(mf)
+        for mf, coeffs in ((mf_hf, (0, 1, 1)), (mf_ks, (0, .5, .5)), (mf_pbe, (0, 0, 0)),
+                           (mf_cam, (.33, .65, .19)), (mf_hse, (.11, 0, .25))):
+            C, core, somo, virt, fbar, xc = sfxtda._reference(mf)
             self.assertEqual((len(core), len(somo), len(virt)), (3, 2, 8))
-            self.assertAlmostEqual(c_h, ch, 12)
+            self.assertAlmostEqual(abs(np.subtract(xc, coeffs)).max(), 0, 12)
             v = mf.get_veff(mol, mf.make_rdm1())
             ref = .5 * C.T @ (2 * mf.get_hcore() + v[0] + v[1]) @ C
             self.assertAlmostEqual(abs(fbar - ref).max(), 0, 10)
 
     def test_bad_reference(self):
-        with self.assertRaises(NotImplementedError):
-            sfxtda._reference(dft.ROKS(mol, xc='CAMB3LYP').density_fit().run())
         with self.assertRaises(TypeError):
             sfxtda._reference(dft.UKS(mol, xc='BHANDHLYP').run())
         with self.assertRaises(ValueError):
@@ -111,6 +115,47 @@ class KnownValues(unittest.TestCase):
         self.assertAlmostEqual(abs(fjb[0, 0] - ints.fbar[np.ix_(ints.core, ints.virt)]).max(), 0, 14)
         with self.assertRaises(RuntimeError):
             ints.value('(ia|jb)')
+
+    def test_kernel_terms(self):
+        kt = sfxtda._kernel_terms
+        self.assertEqual(kt(0, .5, .5), [(.5, 0)])
+        self.assertEqual(kt(0, 0, 0), [])
+        self.assertEqual(kt(.11, 0, .25), [(.25, -.11)])
+        self.assertEqual(kt(.3, 1., 0), [(1., .3)])
+        self.assertEqual(kt(.3, .25, .25), [(.25, 0)])      # alpha = hyb: no erf term
+        t = kt(.33, .65, .19)
+        self.assertAlmostEqual(abs(np.subtract(t, [(.19, 0), (.46, .33)])).max(), 0, 12)
+        t = kt(.3, .1, .3)
+        self.assertAlmostEqual(abs(np.subtract(t, [(.3, 0), (-.2, .3)])).max(), 0, 12)
+
+    def test_rsh_df_integrals(self):
+        for mf in (mf_cam, mf_lc, mf_hse, mf_neg):
+            td = sfxtda.SFXTDA(mf).build()
+            self.assertEqual(mol.omega, 0)      # range_coulomb restored
+            ints = td._ints
+            C = mf.mo_coeff
+            cc, cv, co = C[:, ints.core], C[:, ints.virt], C[:, ints.somo]
+            def w(*cs):
+                '''[pq|rs] from the SCF's own fits via ao2mo.'''
+                shape = [c.shape[1] for c in cs]
+                out = 0
+                for c, o in sfxtda._kernel_terms(*td.xc_coeffs):
+                    if o == 0:
+                        out = out + c * mf.with_df.ao2mo(cs, compact=False).reshape(shape)
+                    else:
+                        with mf.with_df.range_coulomb(o) as d:
+                            out = out + c * d.ao2mo(cs, compact=False).reshape(shape)
+                return out
+            self.assertTrue(np.isin(ints.sign, (-1., 1.)).all())
+            self.assertEqual(ints.sign.min() < 0, mf is mf_neg)
+            ints.allow_4index = True
+            # value() broadcasts to (i, a, j, b)
+            self.assertAlmostEqual(abs(ints.value('(ia|jb)') - w(cc, cv, cc, cv)).max(), 0, 10)
+            self.assertAlmostEqual(abs(ints.value('(ij|ab)') - w(cc, cc, cv, cv).transpose(0, 2, 1, 3)).max(), 0, 10)
+            ints.allow_4index = False
+            v = ints.value('(iO1|jO2)')[:, 0, :, 0]
+            self.assertAlmostEqual(abs(v - w(cc, co[:, :1], cc, co[:, 1:])[:, 0, :, 0]).max(), 0, 10)
+            self.assertEqual(mol.omega, 0)
 
     def test_explicit_blocks(self):
         for mf in (mf_hf, mf_ks):

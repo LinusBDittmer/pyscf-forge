@@ -20,12 +20,16 @@
 SF-XTDA: spin-complete spin-flip extended TDA (ROKS SF-XCIS) on a ROKS/ROHF M_S = +1 triplet.
 
 Model (spin-free, all states spin-pure):
-    H = sum_pq h'_pq E_pq + (c_H/2) sum (pq|rs) e_pqrs,   h' = Fbar - c_H (J - K_C - K_O/2)[Phi0],
-evaluated in the SF-XCIS space (all M_S = 0 determinants with at most one hole in C and at most
-one particle in V) in a CSF basis.  Every matrix element is taken from the generated formulas in
-_blocks.py.  All two-electron integrals are density fitted and no N^4 quantity is built: the
-blocks that touch an OO/CO/OV CSF are stored explicitly (at most N^3), the CV-CV block is applied
-as a sigma vector through one-index operators and DF J/K contractions.
+    H = sum_pq h'_pq E_pq + 1/2 sum [pq|rs] e_pqrs,   h' = Fbar - (J - K_C - K_O/2)[Phi0],
+where [pq|rs] are the integrals over the exact-exchange kernel of the functional,
+    w(r) = hyb/r + (alpha - hyb) erf(omega r)/r      ((omega, alpha, hyb) as in PySCF),
+i.e. c_H/r for global hybrids, and J, K are built from [pq|rs].  It is evaluated in the SF-XCIS
+space (all M_S = 0 determinants with at most one hole in C and at most one particle in V) in a CSF
+basis.  Every matrix element is taken from the generated formulas in _blocks.py.  All two-electron
+integrals are density fitted (PySCF's full-range and erf/erfc fits stacked, with a sign per
+auxiliary function) and no N^4 quantity is built: the blocks that touch an OO/CO/OV CSF are stored
+explicitly (at most N^3), the CV-CV block is applied as a sigma vector through one-index operators
+and DF J/K contractions.
 '''
 
 import contextlib
@@ -350,7 +354,7 @@ class SFXTDA(lib.StreamObject):
         damping : None or (p1, p2)
             DFT/MRCI-style damping p1*exp(-p2*dE^4) of every coupling that involves an OO, CO
             or OV configuration (CV-CV couplings are never damped).  (1.0, 8.0) is recommended
-            for BH&HLYP.
+            for BH&HLYP (fitted there only; no recommended values for range-separated hybrids).
         wfnsym : str or int
             Restrict the roots to one irrep (requires mol.symmetry).
         auxbasis : str

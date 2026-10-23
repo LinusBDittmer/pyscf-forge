@@ -17,7 +17,9 @@
 
 """Auto-generated SF-XCIS CSF matrix elements (from the verified symbolic derivation).
 Each entry: (bra CSF class, name, ket class, name) -> (argument names, function).
-Arguments: delta_ij, delta_ab, F_pq (spin-averaged Fock), "(pq|rs)" (scaled ERIs);
+Arguments: delta_ij, delta_ab, F_pq (spin-averaged Fock), "(pq|rs)" (integrals over the scaled
+interaction w(r12): c_H/r12 for global hybrids, hyb/r12 + (alpha-hyb) erf(omega r12)/r12 for
+range-separated hybrids; the formulas hold for any real symmetric w);
 labels i,a: bra C/V orbital; j,b: ket C/V orbital; O1,O2: SOMOs."""
 import numpy as np
 from numpy import sqrt

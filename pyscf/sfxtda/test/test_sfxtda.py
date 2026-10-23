@@ -284,6 +284,30 @@ class KnownValues(unittest.TestCase):
         for s in (0, 1, 2):
             self.assertLess(abs(td.omega[s] * HARTREE2EV - ref[s]).max(), 5e-3)
 
+    def test_rsh_reference_values(self):
+        # independent determinant CI with exact w-ERIs, undamped; DF deviation measured <= 1.4e-4 eV
+        cases = {
+            'CAM-B3LYP': (-39.109992488,
+                          {0: [-0.357136, 0.383902, 1.469059, 6.811046],
+                           1: [-0.046383, 6.578226, 6.784253, 7.320196],
+                           2: [12.811415, 15.041529, 18.240740, 20.376561]}),
+            'HSE06': (-39.090381831,
+                      {0: [-0.240935, 0.456509, 1.567146, 7.013247],
+                       1: [-0.040819, 6.752383, 6.769513, 7.498453],
+                       2: [12.884263, 15.150584, 18.115097, 20.348769]}),
+        }
+        for xc, (e_tot, ref) in cases.items():
+            mf = dft.ROKS(mol, xc=xc)
+            mf.grids.level = 5
+            mf.conv_tol = 1e-11
+            mf.run()
+            self.assertAlmostEqual(mf.e_tot, e_tot, 7)
+            td = sfxtda.SFXTDA(mf, nstates=4, spins=(0, 1, 2))
+            td.conv_tol = 1e-7
+            td.kernel()
+            for s in (0, 1, 2):
+                self.assertLess(abs(td.omega[s] * HARTREE2EV - ref[s]).max(), 1e-3)
+
 if __name__ == "__main__":
     print("Full Tests for SF-XTDA")
     unittest.main()

@@ -192,6 +192,20 @@ class KnownValues(unittest.TestCase):
         self.assertAlmostEqual(abs(td2.omega[0] - np.linalg.eigvalsh(M[np.ix_(k, k)])[:3]).max(), 0, 9)
         self.assertEqual(set(td2.irrep[0]), {'B1'})
 
+    def test_wfnsym_edge_cases(self):
+        h2o = gto.M(atom="O 0 0 -0.0699; H 0 0.7575 0.5184; H 0 -0.7575 0.5184",
+                    basis='sto-3g', spin=2, symmetry=True, verbose=0)
+        mf = dft.ROKS(h2o, xc='BHANDHLYP').density_fit().run(conv_tol=1e-11)
+        td = sfxtda.SFXTDA(mf, nstates=2, spins=(0, 2))
+        td.wfnsym = 'A1'
+        td.kernel()
+        # no A1 quintet CSF exists in STO-3G: empty result instead of a crash
+        self.assertEqual(len(td.omega[2]), 0)
+        self.assertEqual(len(td.omega[0]), 2)
+        # lowest singlet of one irrep is not the ground state: e falls back to omega
+        for s in (0, 2):
+            self.assertAlmostEqual(abs(td.e[s] - td.omega[s]).max(initial=0), 0, 14)
+
     def test_guide_reference_values(self):
         # implementation guide Sec. 7: exact ERIs, undamped; DF differences expected <~1e-3 eV
         mf = dft.ROKS(mol, xc='BHANDHLYP')

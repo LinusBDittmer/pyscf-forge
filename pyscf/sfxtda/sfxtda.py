@@ -263,15 +263,15 @@ def j_contract(ints, t):
     '''J[T]_ia = sum_jb [ia|jb] T_jb for t of shape (m, nC, nV).'''
     naux = ints.naux
     rho = numpy.tensordot(t, ints.bcv, axes=([1, 2], [1, 2]))
-    return (rho @ ints.bcv.reshape(naux, -1)).reshape(t.shape)
+    return lib.dot(rho, ints.bcv.reshape(naux, -1)).reshape(t.shape)
 
 
 def k_contract(ints, t):
     '''K[T]_ia = sum_jb [ij|ab] T_jb = sum_L (B^L_CC T B^L_VV)_ia for one t of shape (nC, nV).'''
     naux, nC, nV = ints.bcv.shape
-    x = (ints.bcc.reshape(naux * nC, nC) @ t).reshape(naux, nC, nV)
+    x = lib.dot(ints.bcc.reshape(naux * nC, nC), t).reshape(naux, nC, nV)
     x = x.transpose(1, 0, 2).reshape(nC, naux * nV)
-    return x @ ints.bvv.reshape(naux * nV, nV)
+    return lib.dot(x, ints.bvv.reshape(naux * nV, nV))
 
 
 def damp_(hss, hsl, d_small, d_large, p1, p2):
@@ -325,7 +325,8 @@ class SFXTDA(lib.StreamObject):
 
     Saved results (dicts keyed by spin):
         omega : excitation energies (Hartree) relative to the reference energy E_ROKS
-        e : excitation energies relative to the lowest singlet (equal to omega if S=0 not requested)
+        e : excitation energies relative to the lowest singlet (equal to omega if S=0 is not
+            requested or wfnsym is set)
         e_tot : total energies E_ROKS + omega
         irrep : irrep label of each root
         converged : convergence flag of each root
@@ -482,6 +483,13 @@ class SFXTDA(lib.StreamObject):
             forbid = self._forbid(x_sym)
             nallowed = hdiag.size - (0 if forbid is None else numpy.count_nonzero(forbid))
             nroots = min(self.nstates, nallowed)
+            if nroots == 0:
+                log.note('SF-XTDA S=%d: no CSF in the requested irrep/space, no roots', spin)
+                self.omega[spin] = self.e_tot[spin] = numpy.zeros(0)
+                self.converged[spin] = numpy.zeros(0, dtype=bool)
+                self.xs[spin] = numpy.zeros((0, hdiag.size))
+                self.irrep[spin] = []
+                continue
             x0, x0sym = self.get_init_guess(hdiag, nroots, x_sym)
 
             def precond(x, e, *args):
@@ -509,7 +517,11 @@ class SFXTDA(lib.StreamObject):
                 group = {'Dooh': 'D2h', 'Coov': 'C2v'}.get(mol.groupname, mol.groupname)
                 ids = x_sym[abs(xs).argmax(axis=1)]
                 self.irrep[spin] = [symm.irrep_id2name(group, i) for i in ids]
-        e0 = self.omega[0].min() if 0 in self.omega else 0.
+        # with wfnsym the lowest computed singlet is not the ground state: e falls back to omega
+        if self.wfnsym is None and 0 in self.omega and self.omega[0].size:
+            e0 = self.omega[0].min()
+        else:
+            e0 = 0.
         self.e = {spin: w - e0 for spin, w in self.omega.items()}
         log.timer('SF-XTDA', *cpu0)
         self._finalize()

@@ -30,3 +30,6 @@ indent-style = "space"
 line-ending = "auto"
 
 quote-style = "single"
+
+[lint.per-file-ignores]
+"pyscf/sfxtda/_blocks.py" = ["E501"]

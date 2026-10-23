@@ -33,4 +33,5 @@ per-file-ignores =
     pyscf/dh/udfdh.py: E501
     pyscf/dh/rdfdh.py: E501
     pyscf/dh/resp.py: E501
+    pyscf/sfxtda/_blocks.py: E501
 #    pyscf/pbc/tools/pywannier90.py: E501

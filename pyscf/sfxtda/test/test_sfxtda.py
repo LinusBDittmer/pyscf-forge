@@ -153,6 +153,45 @@ class KnownValues(unittest.TestCase):
                     self.assertAlmostEqual(abs(vind(np.eye(M.shape[0])) - M).max(), 0, 10)
                     self.assertAlmostEqual(abs(hdiag - M.diagonal()).max(), 0, 12)
 
+    def test_eigenvalues(self):
+        for mf in (mf_hf, mf_ks):
+            for damping in (None, (1.0, 8.0)):
+                td = sfxtda.SFXTDA(mf, nstates=4, spins=(0, 1, 2), damping=damping)
+                td.conv_tol = 1e-7
+                td.kernel()
+                for spin in (0, 1, 2):
+                    ref = np.linalg.eigvalsh(_dense(td, spin, damping))[:4]
+                    self.assertAlmostEqual(abs(td.omega[spin] - ref).max(), 0, 9)
+                    self.assertTrue(all(td.converged[spin]))
+                self.assertAlmostEqual(abs(td.e_tot[1] - mf.e_tot - td.omega[1]).max(), 0, 12)
+                self.assertAlmostEqual(td.e[0][0], 0, 12)
+
+    def test_nstates_exceeds_dimension(self):
+        td = sfxtda.SFXTDA(mf_ks, nstates=100, spins=(2,))
+        td.conv_tol = 1e-7
+        td.kernel()
+        ref = np.linalg.eigvalsh(_dense(td, 2))
+        self.assertEqual(len(td.omega[2]), 24)
+        self.assertAlmostEqual(abs(td.omega[2] - ref).max(), 0, 9)
+        self.assertAlmostEqual(abs(td.e[2] - td.omega[2]).max(), 0, 14)
+
+    def test_symmetry(self):
+        h2o = gto.M(atom="O 0 0 -0.0699; H 0 0.7575 0.5184; H 0 -0.7575 0.5184",
+                    basis='6-31g', spin=2, symmetry=True, verbose=0)
+        mf = dft.ROKS(h2o, xc='BHANDHLYP').density_fit().run(conv_tol=1e-11)
+        td = sfxtda.SFXTDA(mf, nstates=6, spins=(0,))
+        td.conv_tol = 1e-7
+        td.kernel()
+        M = _dense(td, 0)
+        self.assertAlmostEqual(abs(td.omega[0] - np.linalg.eigvalsh(M)[:6]).max(), 0, 9)
+        td2 = sfxtda.SFXTDA(mf, nstates=3, spins=(0,))
+        td2.conv_tol = 1e-7
+        td2.wfnsym = 'B1'
+        td2.kernel()
+        k = td2.get_csf_irreps(0) == symm.irrep_name2id('C2v', 'B1')
+        self.assertAlmostEqual(abs(td2.omega[0] - np.linalg.eigvalsh(M[np.ix_(k, k)])[:3]).max(), 0, 9)
+        self.assertEqual(set(td2.irrep[0]), {'B1'})
+
 if __name__ == "__main__":
     print("Full Tests for SF-XTDA")
     unittest.main()

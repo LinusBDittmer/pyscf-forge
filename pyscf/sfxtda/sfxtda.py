@@ -29,9 +29,11 @@ as a sigma vector through one-index operators and DF J/K contractions.
 '''
 
 import numpy
-from pyscf import lib, scf, dft, df
+from pyscf import lib, scf, dft, df, symm
 from pyscf.ao2mo import _ao2mo
+from pyscf.data.nist import HARTREE2EV
 from pyscf.lib import logger
+from pyscf.tdscf._lr_eig import eigh as lr_eigh
 from pyscf.sfxtda._blocks import BLOCKS, ORDER, CSF_INFO
 
 # axis of each C/V label in the broadcast shape (bra i, bra a, ket j, ket b)
@@ -285,6 +287,25 @@ def damp_(hss, hsl, d_small, d_large, p1, p2):
     hsl *= f
 
 
+def csf_irreps(blocks, orbsym, core, somo, virt):
+    '''D2h-subgroup irrep id of every CSF (XOR of the orbital irreps).'''
+    orbsym = numpy.asarray(orbsym)
+    s1, s2 = orbsym[somo[0]], orbsym[somo[1]]
+    oc, ov = orbsym[core], orbsym[virt]
+    out = []
+    for cl, nm, _ in blocks:
+        if cl == 'OO':
+            out.append(numpy.array([0 if nm in ('G', 'D') else s1 ^ s2]))
+        elif cl == 'CO':
+            out.append(oc ^ (s2 if 'O1^2' in nm else s1))
+        elif cl == 'OV':
+            out.append((s1 if 'O1^1' in nm else s2) ^ ov)
+        else:
+            base = (oc[:, None] ^ ov[None, :]).ravel()
+            out.append(base if '^2' in nm else base ^ s1 ^ s2)
+    return numpy.concatenate(out)
+
+
 class SFXTDA(lib.StreamObject):
     '''Spin-complete spin-flip extended TDA (ROKS SF-XCIS) on a ROKS or ROHF M_S = +1 triplet.
 
@@ -310,6 +331,11 @@ class SFXTDA(lib.StreamObject):
         converged : convergence flag of each root
         xs : eigenvectors in the CSF basis, shape (nroots, n)
     '''
+    conv_tol = 1e-5
+    max_cycle = 100
+    lindep = 1e-12
+    deg_eia_thresh = 1e-3
+
     def __init__(self, mf, nstates=5, spins=(0, 1), damping=None):
         self._scf = mf
         self.mol = mf.mol
@@ -324,6 +350,17 @@ class SFXTDA(lib.StreamObject):
         self._ints = None
         self._orbs = None
         self.omega = self.e = self.e_tot = self.irrep = self.converged = self.xs = None
+
+    def dump_flags(self, verbose=None):
+        log = logger.new_logger(self, verbose)
+        log.info('')
+        log.info('******** %s for %s ********', self.__class__, self._scf.__class__)
+        log.info('nstates = %d  spins = %s', self.nstates, self.spins)
+        log.info('damping = %s (applied to couplings involving OO/CO/OV only)', self.damping)
+        if self.wfnsym is not None:
+            log.info('wfnsym = %s', self.wfnsym)
+        log.info('conv_tol = %g  max_cycle = %d  max_memory %d MB', self.conv_tol, self.max_cycle, self.max_memory)
+        return self
 
     def build(self):
         log = logger.new_logger(self)
@@ -385,4 +422,106 @@ class SFXTDA(lib.StreamObject):
             out[:, ns:] = sl.reshape(m, -1)
             return out
 
-        return vind, hdiag
+        forbid = self._forbid(self.get_csf_irreps(spin))
+        if forbid is None:
+            return vind, hdiag
+
+        def vind_sym(x):
+            x = numpy.array(x).reshape(-1, n)
+            x[:, forbid] = 0
+            out = vind(x)
+            out[:, forbid] = 0
+            return out
+        return vind_sym, hdiag
+
+    def get_csf_irreps(self, spin):
+        '''Irrep id (D2h subgroup) of every CSF of spin S, or None without point-group symmetry.'''
+        if not self.mol.symmetry:
+            return None
+        if self._orbs is None:
+            self.build()
+        core, somo, virt = self._orbs
+        orbsym = numpy.asarray(scf.hf_symm.get_orbsym(self.mol, self._scf.mo_coeff)) % 10
+        return csf_irreps(csf_list(spin, len(core), len(virt)), orbsym, core, somo, virt)
+
+    def _forbid(self, x_sym):
+        '''Mask of CSFs outside the target irrep wfnsym (None if no restriction).'''
+        if self.wfnsym is None or x_sym is None:
+            return None
+        wfnsym = self.wfnsym
+        if isinstance(wfnsym, str):
+            wfnsym = symm.irrep_name2id(self.mol.groupname, wfnsym)
+        return x_sym != wfnsym % 10
+
+    def get_init_guess(self, hdiag, nstates, x_sym=None):
+        '''Unit vectors on the lowest diagonal elements (allowed irrep only), as in pyscf TDA.'''
+        h = hdiag.copy()
+        forbid = self._forbid(x_sym)
+        if forbid is not None:
+            h[forbid] = 1e99
+        nstates = min(nstates, h.size - (0 if forbid is None else numpy.count_nonzero(forbid)))
+        thresh = numpy.partition(h, nstates - 1)[nstates - 1] + self.deg_eia_thresh
+        idx = numpy.where(h <= thresh)[0]
+        x0 = numpy.zeros((idx.size, h.size))
+        x0[numpy.arange(idx.size), idx] = 1
+        return x0, (None if x_sym is None else x_sym[idx])
+
+    def kernel(self, nstates=None):
+        cpu0 = (logger.process_clock(), logger.perf_counter())
+        if nstates is not None:
+            self.nstates = nstates
+        if self._ints is None:
+            self.build()
+        self.dump_flags()
+        log = logger.new_logger(self)
+        mol = self.mol
+        self.omega, self.converged, self.xs, self.irrep, self.e_tot = {}, {}, {}, {}, {}
+        for spin in self.spins:
+            vind, hdiag = self.gen_vind(spin)
+            x_sym = self.get_csf_irreps(spin)
+            forbid = self._forbid(x_sym)
+            nallowed = hdiag.size - (0 if forbid is None else numpy.count_nonzero(forbid))
+            nroots = min(self.nstates, nallowed)
+            x0, x0sym = self.get_init_guess(hdiag, nroots, x_sym)
+
+            def precond(x, e, *args):
+                if isinstance(e, numpy.ndarray):
+                    e = e[0]
+                d = hdiag - e
+                d[abs(d) < 1e-8] = 1e-8
+                return x / d
+
+            def pick(w, v, nroots, envs):
+                # all roots are physical: SF states may lie below the reference (omega < 0)
+                return w, v, numpy.arange(w.size)
+
+            conv, w, xs = lr_eigh(vind, x0, precond, tol_residual=self.conv_tol, lindep=self.lindep,
+                                  nroots=nroots, x0sym=x0sym, pick=pick, max_cycle=self.max_cycle,
+                                  max_memory=self.max_memory, verbose=log)
+            xs = numpy.asarray(xs)
+            self.omega[spin] = numpy.asarray(w)
+            self.converged[spin] = numpy.asarray(conv)
+            self.xs[spin] = xs
+            self.e_tot[spin] = self._scf.e_tot + self.omega[spin]
+            if x_sym is None:
+                self.irrep[spin] = ['A'] * len(w)
+            else:
+                group = {'Dooh': 'D2h', 'Coov': 'C2v'}.get(mol.groupname, mol.groupname)
+                ids = x_sym[abs(xs).argmax(axis=1)]
+                self.irrep[spin] = [symm.irrep_id2name(group, i) for i in ids]
+        e0 = self.omega[0].min() if 0 in self.omega else 0.
+        self.e = {spin: w - e0 for spin, w in self.omega.items()}
+        log.timer('SF-XTDA', *cpu0)
+        self._finalize()
+        return self.e
+
+    def _finalize(self):
+        log = logger.new_logger(self)
+        for spin in self.spins:
+            if not all(self.converged[spin]):
+                log.note('SF-XTDA S=%d roots %s not converged', spin,
+                         numpy.flatnonzero(~self.converged[spin]).tolist())
+            for k, (w, e, g) in enumerate(zip(self.omega[spin], self.e[spin], self.irrep[spin])):
+                log.note('S=%d  root %2d  %-4s  omega = %10.4f eV  e = %10.4f eV',
+                         spin, k, g, w * HARTREE2EV, e * HARTREE2EV)
+        return self

@@ -83,10 +83,12 @@ class _DFInts:
 
     The three-index factors are scaled by sqrt(c_H), so [pq|rs] = sum_L B^L_pq B^L_rs.
     Integrals with four free C/V indices (N^4) are refused unless allow_4index is set (tests only).
+    For c_H = 0 (pure functionals) every two-electron integral vanishes and no DF tensor is built
+    (naux = 0).
     '''
     def __init__(self, with_df, mo_coeff, core, somo, virt, fbar, c_h):
         nmo = mo_coeff.shape[1]
-        naux = with_df.get_naoaux()
+        naux = with_df.get_naoaux() if c_h != 0 else 0
         self.core, self.somo, self.virt, self.fbar = core, somo, virt, fbar
         nC, nV = len(core), len(virt)
         self.nC, self.nV, self.naux = nC, nV, naux
@@ -99,7 +101,7 @@ class _DFInts:
         self.bo = numpy.empty((naux, 2, nmo))
         mo = numpy.asarray(mo_coeff, order='F')
         p1 = 0
-        for eri1 in with_df.loop():
+        for eri1 in (with_df.loop() if naux else ()):
             p0, p1 = p1, p1 + eri1.shape[0]
             buf = _ao2mo.nr_e2(eri1, mo, (0, nmo, 0, nmo), aosym='s2', mosym='s1').reshape(-1, nmo, nmo)
             self.bcc[p0:p1] = buf[:, core[:, None], core]
@@ -397,8 +399,9 @@ class SFXTDA(lib.StreamObject):
             damp_(hss, hsl, hss.diagonal().copy(), hdl.ravel(), *self.damping)
         hdiag = numpy.concatenate([hss.diagonal(), hdl.ravel()])
         ns, nblk, n = hss.shape[0], cj.shape[0], hdiag.size
-        jrows = numpy.flatnonzero(abs(cj).sum(1))
-        krows = numpy.flatnonzero(abs(ck).sum(1))
+        # c_H = 0: all [pq|rs] vanish, skip the J/K contractions
+        jrows = numpy.flatnonzero(abs(cj).sum(1)) if ints.naux else numpy.zeros(0, dtype=int)
+        krows = numpy.flatnonzero(abs(ck).sum(1)) if ints.naux else numpy.zeros(0, dtype=int)
         log.info('S = %d: %d CSFs (%d small), explicit couplings %.1f MB', spin, n, ns, hsl.nbytes / 1e6)
 
         def vind(x):
@@ -469,6 +472,8 @@ class SFXTDA(lib.StreamObject):
 
     def kernel(self, nstates=None):
         cpu0 = (logger.process_clock(), logger.perf_counter())
+        if not set(self.spins) <= {0, 1, 2}:
+            raise ValueError(f'spins must be a subset of (0, 1, 2), got {self.spins}')
         if nstates is not None:
             self.nstates = nstates
         if self._ints is None:
@@ -531,7 +536,7 @@ class SFXTDA(lib.StreamObject):
         log = logger.new_logger(self)
         for spin in self.spins:
             if not all(self.converged[spin]):
-                log.note('SF-XTDA S=%d roots %s not converged', spin,
+                log.warn('SF-XTDA S=%d roots %s not converged', spin,
                          numpy.flatnonzero(~self.converged[spin]).tolist())
             for k, (w, e, g) in enumerate(zip(self.omega[spin], self.e[spin], self.irrep[spin])):
                 log.note('S=%d  root %2d  %-4s  omega = %10.4f eV  e = %10.4f eV',

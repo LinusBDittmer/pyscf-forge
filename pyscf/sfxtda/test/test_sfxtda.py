@@ -192,6 +192,10 @@ class KnownValues(unittest.TestCase):
         self.assertAlmostEqual(abs(td2.omega[0] - np.linalg.eigvalsh(M[np.ix_(k, k)])[:3]).max(), 0, 9)
         self.assertEqual(set(td2.irrep[0]), {'B1'})
 
+    def test_invalid_spins(self):
+        with self.assertRaisesRegex(ValueError, 'spins'):
+            sfxtda.SFXTDA(mf_ks, spins=(0, 3)).kernel()
+
     def test_wfnsym_edge_cases(self):
         h2o = gto.M(atom="O 0 0 -0.0699; H 0 0.7575 0.5184; H 0 -0.7575 0.5184",
                     basis='sto-3g', spin=2, symmetry=True, verbose=0)

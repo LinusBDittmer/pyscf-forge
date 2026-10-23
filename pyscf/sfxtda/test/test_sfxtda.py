@@ -192,6 +192,22 @@ class KnownValues(unittest.TestCase):
         self.assertAlmostEqual(abs(td2.omega[0] - np.linalg.eigvalsh(M[np.ix_(k, k)])[:3]).max(), 0, 9)
         self.assertEqual(set(td2.irrep[0]), {'B1'})
 
+    def test_guide_reference_values(self):
+        # implementation guide Sec. 7: exact ERIs, undamped; DF differences expected <~1e-3 eV
+        mf = dft.ROKS(mol, xc='BHANDHLYP')
+        mf.grids.level = 5
+        mf.conv_tol = 1e-11
+        mf.run()
+        self.assertAlmostEqual(mf.e_tot, -39.115068731, 7)
+        td = sfxtda.SFXTDA(mf, nstates=4, spins=(0, 1, 2))
+        td.conv_tol = 1e-7
+        td.kernel()
+        ref = {0: [0.332450, 0.962664, 2.408297, 7.724930],
+               1: [-0.061888, 7.146789, 7.332429, 7.819089],
+               2: [12.280731, 14.581284, 17.984860, 20.212472]}
+        for s in (0, 1, 2):
+            self.assertLess(abs(td.omega[s] * HARTREE2EV - ref[s]).max(), 5e-3)
+
 if __name__ == "__main__":
     print("Full Tests for SF-XTDA")
     unittest.main()

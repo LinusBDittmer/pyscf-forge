@@ -19,7 +19,12 @@ AUTHOR_EMAIL = None
 DESCRIPTION  = 'Staging ground for PySCF core features'
 SO_EXTENSIONS = {
 }
-DEPENDENCIES = ['pyscf', 'numpy!=2.4.*']
+DEPENDENCIES = ['pyscf', 'numpy!=2.4.*', 'sympy']
+EXTRAS = {
+    'afqmc-cpu': ['jax'],
+    'afqmc-cuda12': ['jax[cuda12]'],
+    'afqmc-cuda13': ['jax[cuda13]'],
+}
 VERSION = '1.1.1'
 
 #######################################################################
@@ -93,6 +98,9 @@ class CMakeBuildPy(build_py):
         self.announce('Configuring extensions', level=3)
         src_dir = os.path.abspath(os.path.join(__file__, '..', 'pyscf', 'lib'))
         cmd = ['cmake', f'-S{src_dir}', f'-B{self.build_temp}']
+        # The interpreter this build runs under: CMakeLists.txt asks it where pyscf is installed, so that the lookup
+        # does not depend on which python3 is first on PATH.
+        cmd.append(f'-DPython_EXECUTABLE={sys.executable}')
         
         # Allow user to disable OCCRI C extension build
         build_occri = os.getenv('BUILD_OCCRI', 'ON')
@@ -124,7 +132,9 @@ settings = {
     'long_description_content_type': 'text/markdown',
     'author': metadata.get('AUTHOR', None),
     'author_email': metadata.get('AUTHOR_EMAIL', None),
+    'python_requires': '>=3.9',
     'install_requires': metadata.get('DEPENDENCIES', []),
+    'extras_require': metadata.get('EXTRAS', {}),
     'cmdclass': {'build_py': CMakeBuildPy},
 }
 

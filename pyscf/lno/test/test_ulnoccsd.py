@@ -63,7 +63,7 @@ class WaterDimer(unittest.TestCase):
         cls.mol.stdout.close()
         del cls.mol, cls.mf, cls.ecano, cls.frozen
 
-    def test_ulno_pm_by_thresh(self):
+    def test_ulno_pm_by_thresh_slow(self):
         mol = self.mol
         mf = self.mf
         frozen = self.frozen
@@ -76,7 +76,7 @@ class WaterDimer(unittest.TestCase):
             mlo = lo.PipekMezey(mol, orbocc[s])
             lo_coeff_s = mlo.kernel()
             for i in range(100): # always performing jacobi sweep to avoid trapping in local minimum/saddle point
-                stable, lo_coeff1_s = mlo.stability_jacobi()
+                lo_coeff1_s, stable = mlo.stability_jacobi(return_status=True)
                 if stable:
                     break
                 mlo = lo.PipekMezey(mf.mol, lo_coeff1_s).set(verbose=4)

@@ -51,6 +51,27 @@ class KnownValues(unittest.TestCase):
         with self.assertRaises(ValueError):
             sfxtda._reference(scf.ROHF(gto.M(atom=CH2, basis='6-31g', verbose=0)).run())
 
+    def test_df_tensors(self):
+        ints = sfxtda.SFXTDA(mf_ks).build()._ints
+        C = mf_ks.mo_coeff
+        cc, cv = C[:, ints.core], C[:, ints.virt]
+        co1, co2 = C[:, ints.somo[:1]], C[:, ints.somo[1:]]
+        def eri(*cs):
+            shape = [c.shape[1] for c in cs]
+            return .5 * mf_ks.with_df.ao2mo(cs, compact=False).reshape(shape)
+        self.assertAlmostEqual(abs(lib.einsum('Lij,Lab->ijab', ints.bcc, ints.bvv) - eri(cc, cc, cv, cv)).max(), 0, 10)
+        self.assertAlmostEqual(abs(lib.einsum('Lia,Ljb->iajb', ints.bcv, ints.bcv) - eri(cc, cv, cc, cv)).max(), 0, 10)
+        self.assertAlmostEqual(abs(lib.einsum('Lxp,Lyq->xpyq', ints.bo, ints.bo)
+                                   - eri(C[:, ints.somo], C, C[:, ints.somo], C)).max(), 0, 10)
+        v = ints.value('(iO1|jO2)')
+        self.assertEqual(v.shape, (3, 1, 3, 1))
+        self.assertAlmostEqual(abs(v[:, 0, :, 0] - eri(cc, co1, cc, co2)[:, 0, :, 0]).max(), 0, 10)
+        self.assertEqual(ints.value('(ij|O1b)').shape, (3, 1, 3, 8))
+        fjb = ints.value('F_jb')
+        self.assertAlmostEqual(abs(fjb[0, 0] - ints.fbar[np.ix_(ints.core, ints.virt)]).max(), 0, 14)
+        with self.assertRaises(RuntimeError):
+            ints.value('(ia|jb)')
+
 if __name__ == "__main__":
     print("Full Tests for SF-XTDA")
     unittest.main()

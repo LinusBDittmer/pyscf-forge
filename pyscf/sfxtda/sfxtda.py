@@ -257,6 +257,34 @@ def hdiag_large(ints, lc, rv, cj, ck):
             + cj.diagonal()[:, None, None] * jd + ck.diagonal()[:, None, None] * kd)
 
 
+def j_contract(ints, t):
+    '''J[T]_ia = sum_jb [ia|jb] T_jb for t of shape (m, nC, nV).'''
+    naux = ints.naux
+    rho = numpy.tensordot(t, ints.bcv, axes=([1, 2], [1, 2]))
+    return (rho @ ints.bcv.reshape(naux, -1)).reshape(t.shape)
+
+
+def k_contract(ints, t):
+    '''K[T]_ia = sum_jb [ij|ab] T_jb = sum_L (B^L_CC T B^L_VV)_ia for one t of shape (nC, nV).'''
+    naux, nC, nV = ints.bcv.shape
+    x = (ints.bcc.reshape(naux * nC, nC) @ t).reshape(naux, nC, nV)
+    x = x.transpose(1, 0, 2).reshape(nC, naux * nV)
+    return x @ ints.bvv.reshape(naux * nV, nV)
+
+
+def damp_(hss, hsl, d_small, d_large, p1, p2):
+    '''In-place damping p1*exp(-p2*(H_KK-H_LL)^4) of the off-diagonal of hss and of all of hsl.'''
+    f = p1 * numpy.exp(-p2 * (d_small[:, None] - d_small[None, :])**4)
+    numpy.fill_diagonal(f, 1.)
+    hss *= f
+    f = numpy.subtract(d_small[:, None], d_large[None, :])
+    f **= 4
+    f *= -p2
+    numpy.exp(f, out=f)
+    f *= p1
+    hsl *= f
+
+
 class SFXTDA(lib.StreamObject):
     '''Spin-complete spin-flip extended TDA (ROKS SF-XCIS) on a ROKS or ROHF M_S = +1 triplet.
 
@@ -316,3 +344,45 @@ class SFXTDA(lib.StreamObject):
         if mem > self.max_memory:
             log.warn('DF tensors (%.1f MB) exceed max_memory (%d MB)', mem, self.max_memory)
         return self
+
+    def gen_vind(self, spin):
+        '''Sigma-vector function vind(x) for x of shape (m, n) and the exact diagonal hdiag (n,).'''
+        if self._ints is None:
+            self.build()
+        log = logger.new_logger(self)
+        ints = self._ints
+        nC, nV = ints.nC, ints.nV
+        hss, hsl = build_small(ints, spin)
+        lc, rv, cj, ck = cvcv_operator(ints, spin)
+        hdl = hdiag_large(ints, lc, rv, cj, ck)
+        if self.damping is not None:
+            damp_(hss, hsl, hss.diagonal().copy(), hdl.ravel(), *self.damping)
+        hdiag = numpy.concatenate([hss.diagonal(), hdl.ravel()])
+        ns, nblk, n = hss.shape[0], cj.shape[0], hdiag.size
+        jrows = numpy.flatnonzero(abs(cj).sum(1))
+        krows = numpy.flatnonzero(abs(ck).sum(1))
+        log.info('S = %d: %d CSFs (%d small), explicit couplings %.1f MB', spin, n, ns, hsl.nbytes / 1e6)
+
+        def vind(x):
+            x = numpy.asarray(x).reshape(-1, n)
+            m = x.shape[0]
+            xs, xl = x[:, :ns], x[:, ns:]
+            xl3 = xl.reshape(m, nblk, nC, nV)
+            out = numpy.empty_like(x)
+            out[:, :ns] = xs @ hss + xl @ hsl.T
+            sl = (xs @ hsl).reshape(m, nblk, nC, nV)
+            sl += (lc @ xl.reshape(m, nblk * nC, nV)).reshape(m, nblk, nC, nV)
+            sl += (xl3.transpose(0, 2, 1, 3).reshape(m, nC, nblk * nV) @ rv
+                   ).reshape(m, nC, nblk, nV).transpose(0, 2, 1, 3)
+            if jrows.size:
+                tj = numpy.einsum('PQ,mQia->mPia', cj[jrows], xl3)
+                sl[:, jrows] += j_contract(ints, tj.reshape(-1, nC, nV)).reshape(m, -1, nC, nV)
+            if krows.size:
+                tk = numpy.einsum('PQ,mQia->mPia', ck[krows], xl3).reshape(-1, nC, nV)
+                # ponytail: one K build per amplitude matrix keeps the intermediate at naux*nC*nV;
+                # batch several per GEMM if profiling shows small-matrix overhead
+                sl[:, krows] += numpy.stack([k_contract(ints, t) for t in tk]).reshape(m, -1, nC, nV)
+            out[:, ns:] = sl.reshape(m, -1)
+            return out
+
+        return vind, hdiag

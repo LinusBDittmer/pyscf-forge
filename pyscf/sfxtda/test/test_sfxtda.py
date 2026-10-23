@@ -133,6 +133,26 @@ class KnownValues(unittest.TestCase):
         hss, _ = sfxtda.build_small(sfxtda.SFXTDA(mf_ks).build()._ints, 1)
         self.assertAlmostEqual(hss[0, 0], 0, 12)   # 3OO is the first S=1 CSF
 
+    def test_jk_contract(self):
+        ints = sfxtda.SFXTDA(mf_ks).build()._ints
+        t = np.random.default_rng(1).random((2, 3, 8))
+        ints.allow_4index = True
+        iajb = np.broadcast_to(ints.value('(ia|jb)'), (3, 8, 3, 8))
+        ijab = np.broadcast_to(ints.value('(ij|ab)'), (3, 8, 3, 8))
+        ints.allow_4index = False
+        self.assertAlmostEqual(abs(sfxtda.j_contract(ints, t) - np.einsum('iajb,mjb->mia', iajb, t)).max(), 0, 12)
+        self.assertAlmostEqual(abs(sfxtda.k_contract(ints, t[0]) - np.einsum('iajb,jb->ia', ijab, t[0])).max(), 0, 12)
+
+    def test_sigma_vs_dense(self):
+        for mf in (mf_hf, mf_ks, mf_pbe):
+            for damping in (None, (1.0, 8.0)):
+                td = sfxtda.SFXTDA(mf, damping=damping).build()
+                for spin in (0, 1, 2):
+                    M = _dense(td, spin, damping)
+                    vind, hdiag = td.gen_vind(spin)
+                    self.assertAlmostEqual(abs(vind(np.eye(M.shape[0])) - M).max(), 0, 10)
+                    self.assertAlmostEqual(abs(hdiag - M.diagonal()).max(), 0, 12)
+
 if __name__ == "__main__":
     print("Full Tests for SF-XTDA")
     unittest.main()

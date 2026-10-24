@@ -19,6 +19,7 @@ from pyscf import gto, scf, dft, lib, symm
 from pyscf.data.nist import HARTREE2EV
 from pyscf.sfxtda import sfxtda
 from pyscf.sfxtda._blocks import BLOCKS
+from pyscf.sfxtda import _tdm
 
 CH2 = "C 0 0 0; H 0.1 1.0 0.5; H -0.2 -0.95 0.35"
 
@@ -307,6 +308,59 @@ class KnownValues(unittest.TestCase):
             td.kernel()
             for s in (0, 1, 2):
                 self.assertLess(abs(td.omega[s] * HARTREE2EV - ref[s]).max(), 1e-3)
+
+    def test_tdm_table_vs_blocks(self):
+        # one-body identity: with all integrals zero, <u|H-E0|v> = sum_pq F_pq dm(u,v)[q,p] - (u.v) tr(F gamma0)
+        for spin in (0, 1, 2):
+            td = sfxtda.SFXTDA(mf_hf).build()
+            ints = td._ints
+            core, somo, virt = td._orbs
+            nmo = mf_hf.mo_coeff.shape[1]
+            rng = np.random.default_rng(7 + spin)
+            f = rng.standard_normal((nmo, nmo))
+            ints.fbar = f + f.T
+            ints.sign[:] = 0                        # every [pq|rs] -> 0
+            m1 = _dense(td, spin)
+            blocks = sfxtda.csf_list(spin, ints.nC, ints.nV)
+            g0 = np.zeros(nmo)
+            g0[core], g0[somo] = 2, 1
+            for _ in range(3):
+                u, v = rng.standard_normal((2, m1.shape[0]))
+                dm = _tdm.transition_dm(u, v, blocks, core, somo, virt)
+                ref = u @ m1 @ v + (u @ v) * (ints.fbar.diagonal() @ g0)
+                self.assertAlmostEqual(np.einsum('pq,qp->', ints.fbar, dm), ref, 10)
+
+    def test_tdm_keys(self):
+        # table covers exactly the BLOCKS entries that contain an F_pq symbol
+        with_f = {k for k, (args, _) in BLOCKS.items() if any(a.startswith('F_') for a in args)}
+        self.assertEqual(set(_tdm.COUPLINGS), with_f)
+
+    def test_tdm_vs_detci(self):
+        # frozen determinant CI (DF integrals of mf_hf, explicit S^2 projection, <I|E_pq|J> from determinants)
+        td = sfxtda.SFXTDA(mf_hf, nstates=4, spins=(0, 1, 2))
+        td.conv_tol = 1e-9
+        td.kernel()
+        core, somo, virt = td._orbs
+        ref = {  # tr(dm_0J dm_0J), |dm_0J|_F^2 for J = 0..3
+            0: ([15.09034697, -1.32698052, 0.86629602, 0.0015433], [15.09034697, 1.99027892, 0.88195319, 1.68652078]),
+            1: ([13.96273182, 0.005277, 0.06708164, 0.00165499], [13.96273182, 0.9724713, 0.96974053, 0.97816456]),
+            2: ([11.89982431, 0.20624961, -0.23374966, 0.13427764], [11.89982431, 0.82596076, 0.97897885, 0.29174605])}
+        for s in (0, 1, 2):
+            blocks = sfxtda.csf_list(s, len(core), len(virt))
+            dms = [_tdm.transition_dm(td.xs[s][0], td.xs[s][j], blocks, core, somo, virt) for j in range(4)]
+            tr = np.array([np.trace(d @ d) for d in dms])
+            fro = np.array([np.sum(d * d) for d in dms])
+            for got, want in ((tr, ref[s][0]), (fro, ref[s][1])):
+                if s == 1:   # roots 1, 2 are 4.9e-5 Ha apart: compare the pair sum
+                    got, want = [got[0], got[1] + got[2], got[3]], [want[0], want[1] + want[2], want[3]]
+                self.assertLess(abs(np.subtract(got, want)).max(), 1e-6)
+            # state density: trace N, transitions traceless, dm_J0 = dm_0J^T
+            self.assertAlmostEqual(np.trace(dms[0]), mol.nelectron, 10)
+            self.assertLess(np.abs([np.trace(d) for d in dms[1:]]).max(), 1e-10)
+            d10 = _tdm.transition_dm(td.xs[s][1], td.xs[s][0], blocks, core, somo, virt)
+            self.assertLess(abs(d10 - dms[1].T).max(), 1e-12)
+            occ = np.linalg.eigvalsh(dms[0])
+            self.assertTrue(-1e-10 < occ.min() and occ.max() < 2 + 1e-10)
 
 if __name__ == "__main__":
     print("Full Tests for SF-XTDA")

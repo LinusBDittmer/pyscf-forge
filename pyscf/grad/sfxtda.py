@@ -239,7 +239,11 @@ def grad_elec(td_grad, spin, state, atmlst=None):
         atmlst = range(mol.natm)
     occs = _occupations(td)
     p = _pdiff(td, spin, state)
-    dfterms = _df_terms(mol, td._with_df.auxmol, mo, sfxtda._kernel_terms(*td.xc_coeffs))
+    auxmol = td._with_df.auxmol
+    if auxmol is None:
+        # a td-owned DF used only through range_coulomb copies (no full-range term) is never built itself
+        auxmol = df.addons.make_auxmol(mol, td._with_df.auxbasis)
+    dfterms = _df_terms(mol, auxmol, mo, sfxtda._kernel_terms(*td.xc_coeffs))
     ghats = _two_body(td, td.xs[spin][state], spin, dfterms)
     fock = _fock_mo(mf)
     vresp = _uks_response(mf, *occs)
@@ -253,7 +257,7 @@ def grad_elec(td_grad, spin, state, atmlst=None):
     q_ao = lib.einsum('up,tpq,vq->tuv', mo, p / 2 + zz, mo)
     de = _fock_skeleton(mf, td.xc_coeffs, q_ao, numpy.asarray(mf.make_rdm1()), atmlst, td_grad.max_memory)
     if dfterms:
-        de += _df_skeleton(mol, td._with_df.auxmol, mo, dfterms, ghats, atmlst)
+        de += _df_skeleton(mol, auxmol, mo, dfterms, ghats, atmlst)
     s1 = rhf_grad.get_ovlp(mol)
     aoslices = mol.aoslice_by_atom()
     for k, ia in enumerate(atmlst):

@@ -28,6 +28,7 @@ MAKE = {
     'ks': lambda m: dft.ROKS(m, xc='BHANDHLYP').density_fit(),
     'pbe': lambda m: dft.ROKS(m, xc='PBE').density_fit(),
     'cam': lambda m: dft.ROKS(m, xc='CAM-B3LYP').density_fit(),
+    'wb97_nodf': lambda m: dft.ROKS(m, xc='wB97'),          # long-range-only kernel, td-owned DF
 }
 
 def setUpModule():
@@ -236,6 +237,11 @@ class KnownValues(unittest.TestCase):
     def test_grad_vs_fd_direction(self):
         for key in ('hf_nodf', 'ks', 'pbe'):
             _check_fd(self, key)
+
+    def test_grad_nodf_without_full_range_term(self):
+        '''Non-DF reference whose kernel has no full-range term: the td-owned DF is only used through
+        range_coulomb copies, so its own auxmol is never built.'''
+        _check_fd(self, 'wb97_nodf')
 
     def test_grad_vs_fd_rsh_slow(self):
         _check_fd(self, 'cam', tol=1e-5)

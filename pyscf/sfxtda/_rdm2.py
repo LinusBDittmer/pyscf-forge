@@ -34,12 +34,16 @@ bra block u of type A and a ket block v of type B adds, with w = 1 for the same 
 (BLOCKS holds each unordered pair once),
 
     Y[:, p, q] += (w c / 2) sum u v delta F[:, r, s],   Y[:, r, s] += (w c / 2) sum u v delta F[:, p, q].
+
+contract_weighted replaces u v by a general symmetric CSF weight W (the damped-model gradient): dense blocks
+between small CSFs and from small to CV CSFs, and a diagonal on each CV-CV block, for which every ket label is
+renamed to the bra label (j -> i, b -> a); w keeps its meaning because W is symmetric.
 '''
 
 import itertools
 import numpy
 from pyscf.sfxtda._blocks import BLOCKS
-from pyscf.sfxtda._tdm import _BRA, _KET
+from pyscf.sfxtda._tdm import _BRA, _KET, _ren, _wsub, _layout, weight_blocks
 from pyscf.sfxtda.sfxtda import _labels
 
 _DELTAS = ('delta_ij', 'delta_ab')
@@ -71,34 +75,49 @@ def _probe(args, f):
 TWO_BODY = {key: t for key, v in BLOCKS.items() if (t := _probe(*v))}
 
 
+def _add(y, kind, ops, A, B, terms, f, orb, w):
+    '''Y contributions of the terms of one CSF-type pair with pair weight w (CSF weight see _tdm._wsub).'''
+    nk = f.shape[0]
+    for c, name, deltas in terms:
+        ren = _ren(kind, deltas)
+        ket = ''.join(ren.get(k, k) for k in _KET[B])
+        left, right = name[1:-1].split('|')
+        labs = _labels(left) + _labels(right)
+        sub = [ren.get(lab, lab) if lab in 'ijab' else 'wxyz'[n] for n, lab in enumerate(labs)]
+        for (r, s), (t, v) in (((0, 1), (2, 3)), ((2, 3), (0, 1))):
+            fs = f[:, orb[labs[t]][:, None], orb[labs[v]]]
+            out = ''.join(k for k in (sub[r], sub[s]) if k in 'ijab')
+            rep = len(out) == 2 and out[0] == out[1]
+            blk = numpy.einsum(f'{_wsub(kind, A, ket)},L{sub[t]}{sub[v]}->L{out[:1] if rep else out}', *ops, fs,
+                               optimize=True)
+            if rep:
+                # repeated output label (diagonal weight only): numpy einsum cannot write a diagonal
+                idx = orb[labs[r]]
+                y[:, idx, idx] += (.5 * w * c) * blk
+            else:
+                y[:, orb[labs[r]][:, None], orb[labs[s]]] += (.5 * w * c) * blk.reshape(
+                    nk, len(orb[labs[r]]), len(orb[labs[s]]))
+
+
 def contract(x, blocks, f, core, somo, virt):
     '''Y[f] (K, nmo, nmo) of the CSF vector x (blocks = csf_list(spin, nC, nV)) for symmetric f (K, nmo, nmo).'''
-    nC, nV = len(core), len(virt)
-    orb = {'i': core, 'j': core, 'a': virt, 'b': virt, 'O1': somo[:1], 'O2': somo[1:]}
-    shape = {'OO': (), 'CO': (nC,), 'OV': (nV,), 'CV': (nC, nV)}
-    off = numpy.cumsum([0] + [r * c for _, _, (r, c) in blocks])
+    orb, shape, off = _layout(blocks, core, somo, virt)
     us = [x[off[k]:off[k+1]].reshape(shape[cl]) for k, (cl, _, _) in enumerate(blocks)]
     y = numpy.zeros_like(f)
-    nk = f.shape[0]
     for p, (A, na, _) in enumerate(blocks):
         for q, (B, nb, _) in enumerate(blocks):
             terms = TWO_BODY.get((A, na, B, nb))
-            if terms is None:
-                continue
-            w = 1 if p == q else 2
-            for c, name, deltas in terms:
-                ren = {'j': 'i'} if 'ij' in deltas else {}
-                if 'ab' in deltas:
-                    ren['b'] = 'a'
-                ket = ''.join(ren.get(k, k) for k in _KET[B])
-                left, right = name[1:-1].split('|')
-                labs = _labels(left) + _labels(right)
-                sub = [ren.get(lab, lab) if lab in 'ijab' else 'wxyz'[n] for n, lab in enumerate(labs)]
-                for (r, s), (t, v) in (((0, 1), (2, 3)), ((2, 3), (0, 1))):
-                    fs = f[:, orb[labs[t]][:, None], orb[labs[v]]]
-                    out = ''.join(k for k in (sub[r], sub[s]) if k in 'ijab')
-                    blk = numpy.einsum(f'{_BRA[A]},{ket},L{sub[t]}{sub[v]}->L{out}', us[p], us[q], fs,
-                                       optimize=True)
-                    y[:, orb[labs[r]][:, None], orb[labs[s]]] += (.5 * w * c) * blk.reshape(
-                        nk, len(orb[labs[r]]), len(orb[labs[s]]))
+            if terms is not None:
+                _add(y, 'outer', (us[p], us[q]), A, B, terms, f, orb, 1 if p == q else 2)
+    return .5 * (y + y.transpose(0, 2, 1))
+
+
+def contract_weighted(wss, wsl, gl, blocks, f, core, somo, virt):
+    '''Y_W[f] (K, nmo, nmo) of a symmetric CSF weight W (see _tdm.weight_blocks) for symmetric f (K, nmo, nmo).'''
+    orb, _, _ = _layout(blocks, core, somo, virt)
+    y = numpy.zeros_like(f)
+    for p, q, kind, ops in weight_blocks(wss, wsl, gl, blocks, core, somo, virt):
+        terms = TWO_BODY.get(blocks[p][:2] + blocks[q][:2])
+        if terms is not None:
+            _add(y, kind, ops, blocks[p][0], blocks[q][0], terms, f, orb, 1 if p == q else 2)
     return .5 * (y + y.transpose(0, 2, 1))

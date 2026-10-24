@@ -110,6 +110,21 @@ def _rotated(mf, seed, by_irrep=False):
     mf2.mo_coeff = lib.tag_array(mo, orbsym=orbsym) if by_irrep else mo
     return mf2
 
+def _random_weights(rng, ns, nl):
+    wss = rng.standard_normal((ns, ns))
+    return wss + wss.T, rng.standard_normal((ns, nl)), rng.standard_normal(nl)
+
+def _dense_w(wss, wsl, gl):
+    ns, nl = wsl.shape
+    w = np.zeros((ns + nl, ns + nl))
+    w[:ns, :ns], w[:ns, ns:], w[ns:, :ns] = wss, wsl, wsl.T
+    w[ns:, ns:] += np.diag(gl)
+    return w
+
+def _sizes(spin, nC, nV):
+    small, large = sfxtda._split(spin, nC, nV)
+    return sum(r * c for _, _, (r, c) in small), sum(r * c for _, _, (r, c) in large)
+
 class KnownValues(unittest.TestCase):
     def test_reference(self):
         for mf, coeffs in ((mf_hf, (0, 1, 1)), (mf_ks, (0, .5, .5)), (mf_pbe, (0, 0, 0)),
@@ -569,6 +584,49 @@ class KnownValues(unittest.TestCase):
         for spin in (0, 1):
             self.assertEqual(tds[0].irrep[spin], tds[1].irrep[spin])
             self.assertAlmostEqual(abs(tds[0].omega[spin] - tds[1].omega[spin]).max(), 0, 9)
+
+    def test_weighted_dm_vs_dense(self):
+        '''sum W.H == tr(P_W Fbar) for random symmetric CSF weights, random Fbar, all integrals zero.'''
+        td = sfxtda.SFXTDA(mf_hf, spins=(0, 1, 2)).build()
+        ints = td._ints
+        core, somo, virt = td._orbs
+        nmo = mf_hf.mo_coeff.shape[1]
+        rng = np.random.default_rng(23)
+        fbar = rng.standard_normal((nmo, nmo))
+        fbar += fbar.T
+        ints.naux, ints.sign = 0, np.zeros(0)
+        ints.bcc, ints.bcv, ints.bvv, ints.bo = (np.zeros((0,) + b.shape[1:])
+                                                 for b in (ints.bcc, ints.bcv, ints.bvv, ints.bo))
+        ints.fbar, ints._cache = fbar, {}
+        for spin in (0, 1, 2):
+            blocks = sfxtda.csf_list(spin, len(core), len(virt))
+            wss, wsl, gl = _random_weights(rng, *_sizes(spin, len(core), len(virt)))
+            p = _tdm.weighted_dm(wss, wsl, gl, blocks, core, somo, virt)
+            self.assertAlmostEqual(abs(p - p.T).max(), 0, 12)
+            self.assertAlmostEqual(np.sum(_dense_w(wss, wsl, gl) * _dense(td, spin)), np.sum(p * fbar), 9)
+
+    def test_contract_weighted_vs_dense(self):
+        '''sum W.H == sum_L s_L <Y_W[B]^L, B^L> for random weights, random B and signs, Fbar = 0.'''
+        td = sfxtda.SFXTDA(mf_hf, spins=(0, 1, 2)).build()
+        ints = td._ints
+        core, somo, virt = td._orbs
+        nmo = mf_hf.mo_coeff.shape[1]
+        rng = np.random.default_rng(29)
+        b = rng.standard_normal((9, nmo, nmo))
+        b += b.transpose(0, 2, 1)
+        sign = rng.choice([-1., 1.], 9)
+        ints.naux, ints.sign = 9, sign
+        ints.bcc, ints.bcv = b[:, core[:, None], core], b[:, core[:, None], virt]
+        ints.bvv, ints.bo = b[:, virt[:, None], virt], b[:, somo]
+        ints.fbar = np.zeros_like(ints.fbar)
+        ints._cache = {}
+        for spin in (0, 1, 2):
+            blocks = sfxtda.csf_list(spin, len(core), len(virt))
+            wss, wsl, gl = _random_weights(rng, *_sizes(spin, len(core), len(virt)))
+            y = _rdm2.contract_weighted(wss, wsl, gl, blocks, b, core, somo, virt)
+            self.assertAlmostEqual(abs(y - y.transpose(0, 2, 1)).max(), 0, 12)
+            self.assertAlmostEqual(np.einsum('L,Lpq,Lpq->', sign, y, b),
+                                   np.sum(_dense_w(wss, wsl, gl) * _dense(td, spin)), 9)
 
 if __name__ == "__main__":
     print("Full Tests for SF-XTDA")

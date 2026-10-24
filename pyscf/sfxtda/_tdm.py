@@ -30,6 +30,10 @@ F = h' and <mu|H-E0|nu> = sum_rs h'_rs Delta_{mu nu, rs}); F is symmetric, and o
 one with r = orbital more occupied in the bra survives.  COUPLINGS lists every nonzero Delta per pair of
 CSF types (same key order as BLOCKS, the reverse pair follows from <nu|E_sr|mu> = <mu|E_rs|nu>) as
 (c, r, s, deltas): Delta = c * deltas.  Labels i, a: bra hole/particle; j, b: ket; O1, O2: SOMOs.
+
+weighted_dm contracts Delta with a general symmetric CSF weight W instead of x^I x^J (the damped-model gradient):
+dense blocks between small (OO, CO, OV) CSFs and from small to CV CSFs, and a diagonal on each CV-CV block, for
+which every ket label is renamed to the bra label (j -> i, b -> a).
 '''
 
 import numpy
@@ -123,16 +127,76 @@ _BRA = {'OO': '', 'CO': 'i', 'OV': 'a', 'CV': 'ia'}
 _KET = {'OO': '', 'CO': 'j', 'OV': 'b', 'CV': 'jb'}
 
 
-def _add(g, u, v, A, B, terms, orb):
-    '''g[r, s] += sum c * u_(bra indices) v_(ket indices) for the terms of one CSF-type pair.'''
+def _ren(kind, deltas):
+    '''Ket -> bra label renaming of one term: by its deltas, or all labels for a diagonal weight.'''
+    if kind == 'diag':
+        return {'j': 'i', 'b': 'a'}
+    ren = {'j': 'i'} if 'ij' in deltas else {}
+    if 'ab' in deltas:
+        ren['b'] = 'a'
+    return ren
+
+
+def _wsub(kind, A, ket):
+    '''einsum subscripts of the CSF weight: outer product (u, v), dense block (w,) or CV diagonal (g,).'''
+    return {'outer': f'{_BRA[A]},{ket}', 'dense': _BRA[A] + ket, 'diag': _BRA[A]}[kind]
+
+
+def _add(g, kind, ops, A, B, terms, orb):
+    '''g[r, s] += sum c * W_(bra indices, ket indices) for the terms of one CSF-type pair (weight see _wsub).'''
     for c, r, s, d in terms:
-        ren = {'j': 'i'} if 'ij' in d else {}
-        if 'ab' in d:
-            ren['b'] = 'a'
+        ren = _ren(kind, d)
         ket = ''.join(ren.get(k, k) for k in _KET[B])
         out = ''.join(ren.get(k, k) for k in (r, s) if k in 'ijab')
-        blk = numpy.einsum(f'{_BRA[A]},{ket}->{out}', u, v)
+        if len(out) == 2 and out[0] == out[1]:
+            # repeated output label (diagonal weight only): numpy einsum cannot write a diagonal
+            idx = orb[r]
+            g[idx, idx] += c * numpy.einsum(f'{_wsub(kind, A, ket)}->{out[0]}', *ops)
+            continue
+        blk = numpy.einsum(f'{_wsub(kind, A, ket)}->{out}', *ops)
         g[numpy.ix_(orb[r], orb[s])] += c * blk.reshape(len(orb[r]), len(orb[s]))
+
+
+def _layout(blocks, core, somo, virt):
+    nC, nV = len(core), len(virt)
+    orb = {'i': core, 'j': core, 'a': virt, 'b': virt, 'O1': somo[:1], 'O2': somo[1:]}
+    shape = {'OO': (), 'CO': (nC,), 'OV': (nV,), 'CV': (nC, nV)}
+    off = numpy.cumsum([0] + [r * c for _, _, (r, c) in blocks])
+    return orb, shape, off
+
+
+def weight_blocks(wss, wsl, gl, blocks, core, somo, virt):
+    '''(p, q, kind, ops) of a symmetric CSF weight W given by its small-small block wss, small-large block wsl and
+    the diagonal gl of the large-large block (layout of hss, hsl and hdiag_large); pairs in csf_list order.'''
+    _, shape, off = _layout(blocks, core, somo, virt)
+    ns = sum(r * c for cl, _, (r, c) in blocks if cl != 'CV')
+    out = []
+    for p, (A, _, _) in enumerate(blocks):
+        for q, (B, _, _) in enumerate(blocks):
+            if A == 'CV' and B == 'CV':
+                if p == q:
+                    out.append((p, q, 'diag', (gl[off[p]-ns:off[p+1]-ns].reshape(shape[A]),)))
+            elif A != 'CV':
+                w = wss[off[p]:off[p+1], off[q]:off[q+1]] if B != 'CV' else wsl[off[p]:off[p+1], off[q]-ns:off[q+1]-ns]
+                out.append((p, q, 'dense', (w.reshape(shape[A] + shape[B]),)))
+    return out
+
+
+def weighted_dm(wss, wsl, gl, blocks, core, somo, virt):
+    '''sum_{mu nu} W_{mu nu} Delta_{mu nu, rs} of a symmetric CSF weight W (see weight_blocks); symmetric, no
+    tr(W) gamma0 term.'''
+    orb, _, _ = _layout(blocks, core, somo, virt)
+    nmo = len(core) + len(somo) + len(virt)
+    g = numpy.zeros((nmo, nmo))
+    for p, q, kind, ops in weight_blocks(wss, wsl, gl, blocks, core, somo, virt):
+        terms = COUPLINGS.get(blocks[p][:2] + blocks[q][:2])
+        if terms is None:
+            continue
+        gpq = numpy.zeros((nmo, nmo))
+        _add(gpq, kind, ops, blocks[p][0], blocks[q][0], terms, orb)
+        # W symmetric: the reverse pair <nu|E_rs|mu> W_nu,mu adds the transpose
+        g += gpq if p == q else gpq + gpq.T
+    return g
 
 
 def transition_dm(xbra, xket, blocks, core, somo, virt):
@@ -140,11 +204,8 @@ def transition_dm(xbra, xket, blocks, core, somo, virt):
 
     blocks is csf_list(spin, nC, nV); bra == ket gives the state density.
     '''
-    nC, nV = len(core), len(virt)
-    nmo = nC + len(somo) + nV
-    orb = {'i': core, 'j': core, 'a': virt, 'b': virt, 'O1': somo[:1], 'O2': somo[1:]}
-    shape = {'OO': (), 'CO': (nC,), 'OV': (nV,), 'CV': (nC, nV)}
-    off = numpy.cumsum([0] + [r * c for _, _, (r, c) in blocks])
+    orb, shape, off = _layout(blocks, core, somo, virt)
+    nmo = len(core) + len(somo) + len(virt)
     ub = [xbra[off[k]:off[k+1]].reshape(shape[cl]) for k, (cl, _, _) in enumerate(blocks)]
     uk = [xket[off[k]:off[k+1]].reshape(shape[cl]) for k, (cl, _, _) in enumerate(blocks)]
     g = numpy.zeros((nmo, nmo))
@@ -154,10 +215,10 @@ def transition_dm(xbra, xket, blocks, core, somo, virt):
             terms = COUPLINGS.get((A, na, B, nb))
             if terms is None:
                 continue
-            _add(g, ub[p], uk[q], A, B, terms, orb)
+            _add(g, 'outer', (ub[p], uk[q]), A, B, terms, orb)
             if p != q:
                 # bra of type B, ket of type A: <nu|E_sr|mu> = <mu|E_rs|nu>
-                _add(gt, uk[p], ub[q], A, B, terms, orb)
+                _add(gt, 'outer', (uk[p], ub[q]), A, B, terms, orb)
     g += gt.T
     ov = xbra @ xket
     g[core, core] += 2 * ov

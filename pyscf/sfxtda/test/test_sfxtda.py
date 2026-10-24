@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
 import unittest
 import numpy as np
 from pyscf import gto, scf, dft, lib, symm
@@ -20,6 +21,7 @@ from pyscf.data.nist import HARTREE2EV
 from pyscf.sfxtda import sfxtda
 from pyscf.sfxtda._blocks import BLOCKS
 from pyscf.sfxtda import _tdm
+from pyscf.sfxtda import _rdm2
 
 CH2 = "C 0 0 0; H 0.1 1.0 0.5; H -0.2 -0.95 0.35"
 
@@ -78,6 +80,18 @@ def _dense(td, spin, damping=None):
         fac = damping[0] * np.exp(-damping[1] * (d[:, None] - d[None, :])**4)
         M *= np.where((cid[:, None] != cid[None, :]) & ~(cv[:, None] & cv[None, :]), fac, 1.)
     return M
+
+def _full_b(td):
+    '''Signed DF factors (naux, nmo, nmo) of td's kernel terms, stacked as in _DFInts.'''
+    mo = td._scf.mo_coeff
+    bs, signs = [], []
+    for c, o in sfxtda._kernel_terms(*td.xc_coeffs):
+        with (contextlib.nullcontext(td._with_df) if o == 0 else td._with_df.range_coulomb(o)) as d:
+            for eri1 in d.loop():
+                b = lib.unpack_tril(eri1)
+                bs.append(np.sqrt(abs(c)) * lib.einsum('Luv,up,vq->Lpq', b, mo, mo))
+                signs.append(np.full(len(b), np.sign(c)))
+    return np.concatenate(bs), np.concatenate(signs)
 
 class KnownValues(unittest.TestCase):
     def test_reference(self):
@@ -443,6 +457,62 @@ class KnownValues(unittest.TestCase):
         td.reset()
         for attr in ('_ints', '_orbs', '_with_df', 'xs', 'omega', 'e_tot'):
             self.assertIsNone(getattr(td, attr))
+
+    def test_rdm2_random_integrals(self):
+        '''sum_L s_L <Y[B]^L, B^L> == x.(H-E0).x for random B, random signs, Fbar = 0 and random x.'''
+        td = sfxtda.SFXTDA(mf_hf, spins=(0, 1, 2)).build()
+        ints = td._ints
+        core, somo, virt = td._orbs
+        nmo = mf_hf.mo_coeff.shape[1]
+        rng = np.random.default_rng(7)
+        b = rng.standard_normal((9, nmo, nmo))
+        b += b.transpose(0, 2, 1)
+        sign = rng.choice([-1., 1.], 9)
+        ints.naux, ints.sign = 9, sign
+        ints.bcc, ints.bcv = b[:, core[:, None], core], b[:, core[:, None], virt]
+        ints.bvv, ints.bo = b[:, virt[:, None], virt], b[:, somo]
+        ints.fbar = np.zeros_like(ints.fbar)
+        ints._cache = {}
+        for spin in (0, 1, 2):
+            vind, hdiag = td.gen_vind(spin)
+            x = rng.standard_normal(hdiag.size)
+            y = _rdm2.contract(x, sfxtda.csf_list(spin, len(core), len(virt)), b, core, somo, virt)
+            self.assertAlmostEqual(np.einsum('L,Lpq,Lpq->', sign, y, b), x @ vind(x[None])[0], 9)
+
+    def test_rdm2_eigvec_identity(self):
+        '''omega_k == tr(P Fbar) + sum_L s_L <Y[B]^L, B^L> for converged roots (global and RSH kernels).'''
+        for mf in (mf_hf, mf_cam, mf_neg):
+            td = sfxtda.SFXTDA(mf, nstates=3, spins=(0, 1, 2))
+            td.kernel()
+            core, somo, virt = td._orbs
+            b, sign = _full_b(td)
+            g0 = np.zeros(mf.mo_coeff.shape[1])
+            g0[core], g0[somo] = 2, 1
+            for spin in (0, 1, 2):
+                for k in range(len(td.omega[spin])):
+                    x = td.xs[spin][k]
+                    p = td.transition_dm(spin, k, k) - np.diag(g0)
+                    y = _rdm2.contract(x, sfxtda.csf_list(spin, len(core), len(virt)), b, core, somo, virt)
+                    fbar = sfxtda._reference(mf)[4]                       # full-MO Fbar
+                    e = np.einsum('pq,pq', p, fbar) + np.einsum('L,Lpq,Lpq->', sign, y, b)
+                    self.assertAlmostEqual(e, td.omega[spin][k], 8)
+
+    def test_rdm2_pair_symmetry(self):
+        '''<Y[F], G> == <F, Y[G]> and Y symmetric in pq.'''
+        td = sfxtda.SFXTDA(mf_hf, nstates=2)
+        td.kernel()
+        core, somo, virt = td._orbs
+        rng = np.random.default_rng(3)
+        nmo = mf_hf.mo_coeff.shape[1]
+        f, g = rng.standard_normal((2, 4, nmo, nmo))
+        f += f.transpose(0, 2, 1)
+        g += g.transpose(0, 2, 1)
+        blocks = sfxtda.csf_list(1, len(core), len(virt))
+        x = td.xs[1][0]
+        yf = _rdm2.contract(x, blocks, f, core, somo, virt)
+        yg = _rdm2.contract(x, blocks, g, core, somo, virt)
+        self.assertAlmostEqual(abs(yf - yf.transpose(0, 2, 1)).max(), 0, 12)
+        self.assertAlmostEqual(np.sum(yf * g), np.sum(f * yg), 10)
 
 if __name__ == "__main__":
     print("Full Tests for SF-XTDA")

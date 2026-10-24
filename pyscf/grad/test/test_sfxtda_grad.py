@@ -77,6 +77,18 @@ def _lagr(td, spin, state):
     x = sfxtda_grad._orbital_lagrangian(fock, vresp, mo, occs, (p / 2, p / 2), dfterms, ghats)
     return x, fock, vresp, occs, dfterms, ghats, p
 
+def _unpack(k, mask):
+    kap = np.zeros(mask.shape)
+    kap[mask] = k
+    return kap - kap.T
+
+def _rohf_g(td, mo, mask):
+    '''ROKS orbital gradient (X^E - X^E^T)[mask] at orbitals mo.'''
+    na, nb = sfxtda_grad._occupations(td)
+    f = td._scf.get_fock(dm=np.array([(mo * na) @ mo.T, (mo * nb) @ mo.T]))
+    xe = 2 * ((mo.T @ f.focka @ mo) * na + (mo.T @ f.fockb @ mo) * nb)
+    return (xe - xe.T)[mask]
+
 
 class KnownValues(unittest.TestCase):
     def test_df_terms_reproduce_omega(self):
@@ -105,6 +117,35 @@ class KnownValues(unittest.TestCase):
                 asym = xl - xl.T
                 for sp in (core, somo, virt):                 # redundant rotations: invariance
                     self.assertLess(abs(asym[np.ix_(sp, sp)]).max(), 1e-8)
+
+    def test_rohf_hessian_vs_fd(self):
+        rng = np.random.default_rng(5)
+        for key in ('hf', 'ks'):
+            td = _td(MF[key])
+            mo = td._scf.mo_coeff
+            occs = sfxtda_grad._occupations(td)
+            mask, hop, hdiag = sfxtda_grad._rohf_hessian(sfxtda_grad._fock_mo(td._scf),
+                                                         sfxtda_grad._uks_response(td._scf, *occs), mo, occs)
+            n = np.count_nonzero(mask)
+            jac = np.array([hop(e) for e in np.eye(n)]).T
+            self.assertLess(abs(jac - jac.T).max(), 1e-7)
+            k = rng.standard_normal(n) * 1e-4
+            fd = (_rohf_g(td, mo @ expm(_unpack(k, mask)), mask) - _rohf_g(td, mo @ expm(-_unpack(k, mask)), mask)) / 2
+            self.assertLess(abs(fd - jac @ k).max(), 1e-9)
+            self.assertLess(abs(np.diag(jac) - hdiag).max() / abs(hdiag).max(), 1.)  # sane preconditioner
+
+    def test_z_vector_stationary(self):
+        '''After the Z-vector solve, X^L - X^L^T vanishes on every orbital pair.'''
+        for key in ('hf', 'ks', 'cam'):
+            td = _td(MF[key])
+            mo = td._scf.mo_coeff
+            for spin, state in ((0, 0), (1, 0)):
+                xo, fock, vresp, occs = _lagr(td, spin, state)[:4]
+                mask, hop, hdiag = sfxtda_grad._rohf_hessian(fock, vresp, mo, occs)
+                z = sfxtda_grad.solve_z(hop, hdiag, -(xo - xo.T)[mask], 1e-10, 100, lib.logger.new_logger(td))
+                zz = sfxtda_grad._z_densities(z, mask, occs)
+                xl = xo + sfxtda_grad._orbital_lagrangian(fock, vresp, mo, occs, zz, [], [])
+                self.assertLess(abs(xl - xl.T).max(), 1e-7)
 
 
 if __name__ == "__main__":

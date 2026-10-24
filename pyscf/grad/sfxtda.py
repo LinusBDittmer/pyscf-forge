@@ -105,3 +105,59 @@ def _orbital_lagrangian(fock, vresp, mo, occs, q, dfterms, ghats):
     for (_, _, tt, _), g in zip(dfterms, ghats):
         x = x + 2 * lib.einsum('Prs,Psp->rp', tt, g)
     return x
+
+
+def _rohf_hessian(fock, vresp, mo, occs):
+    '''Exact ROHF/ROKS orbital Jacobian on the non-redundant pairs mask[r, p] = occ[p] > occ[r].'''
+    occ = occs[0] + occs[1]
+    mask = occ[None, :] > occ[:, None]
+
+    def hop(z):
+        kap = numpy.zeros(mask.shape)
+        kap[mask] = z
+        kap -= kap.T
+        dd = numpy.array([mo @ (kap * n[None, :] - n[:, None] * kap) @ mo.T for n in occs])
+        v = vresp(dd)
+        x = 0
+        for f, vt, n in zip(fock, v, occs):
+            x = x + 2 * (f @ kap - kap @ f + mo.T @ vt @ mo) * n[None, :]
+        return (x - x.T)[mask]
+
+    hd = 0
+    for f, n in zip(fock, occs):
+        e = f.diagonal()
+        hd = hd + 2 * (e[:, None] - e[None, :]) * (n[None, :] - n[:, None])
+    return mask, hop, hd[mask]
+
+
+def solve_z(hop, hdiag, rhs, tol, max_cycle, log):
+    '''Solve J z = rhs with lib.krylov, diagonally preconditioned.
+
+    lib.krylov stops on an absolute norm of its (unnormalised, once-orthogonalised) Krylov vectors, at a
+    residual far above tol: solve for the normalised residual and restart from it.
+    '''
+    hd = hdiag.copy()
+    hd[abs(hd) < 1e-8] = 1e-8
+    z = numpy.zeros_like(rhs)
+    r = rhs
+    thresh = tol * max(1, numpy.linalg.norm(rhs))
+    for _ in range(5):
+        if numpy.linalg.norm(r) < thresh:
+            break
+        b = r / hd
+        nb = numpy.linalg.norm(b)
+        z = z + nb * lib.krylov(lambda xs: numpy.array([(hop(x) - hd * x) / hd for x in xs]), b / nb,
+                                tol=tol, max_cycle=max_cycle)
+        r = rhs - hop(z)
+    res = numpy.linalg.norm(r)
+    if res > 10 * tol * max(1, numpy.linalg.norm(rhs)):
+        log.warn('Z-vector not converged: |J z - rhs| = %.3g', res)
+    return z
+
+
+def _z_densities(z, mask, occs):
+    '''Spin densities Z_t (MO) of the ROKS gradient term z.g = sum_t tr(Z_t F_t).'''
+    out = numpy.zeros((2,) + mask.shape)
+    for zt, n in zip(out, occs):
+        zt[mask] = 2 * z * (n[None, :] - n[:, None])[mask]
+    return .5 * (out + out.transpose(0, 2, 1))

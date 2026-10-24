@@ -144,6 +144,31 @@ def _orbital_lagrangian(fock, vresp, mo, occs, q, dfterms, ghats):
     return x
 
 
+def _canonical_pz(xo, eps, spaces, log, thresh=1e-6):
+    '''Multiplier density of the canonical condition Fbar_rp = 0 (r != p in one space):
+    A_rp + 2 (eps_r - eps_p) Pz_rp = 0 with A = xo - xo^T.
+
+    Pairs with |eps_r - eps_p| < thresh get 0; a warning is issued if such a pair has |A_rp| > 1e-6
+    (the damped energy then depends on the arbitrary rotation inside the degenerate set).
+    '''
+    a = xo - xo.T
+    pz = numpy.zeros_like(xo)
+    for sp in spaces:
+        de = eps[sp, None] - eps[None, sp]
+        asp = a[numpy.ix_(sp, sp)]
+        deg = abs(de) < thresh
+        numpy.fill_diagonal(deg, False)
+        ok = ~deg & ~numpy.eye(len(sp), dtype=bool)
+        blk = numpy.zeros_like(asp)
+        blk[ok] = -asp[ok] / (2 * de[ok])
+        pz[numpy.ix_(sp, sp)] = blk
+        for r, q in zip(*numpy.nonzero(numpy.triu(deg & (abs(asp) > 1e-6)))):
+            log.warn('SF-XTDA damped gradient: canonical orbitals %d and %d are degenerate (|de| < %g) but carry a '
+                     'Lagrangian asymmetry of %.2g; the damped energy depends on their arbitrary rotation, the '
+                     'gradient is approximate', sp[r], sp[q], thresh, asp[r, q])
+    return pz
+
+
 def _rohf_hessian(fock, vresp, mo, occs):
     '''Exact ROHF/ROKS orbital Jacobian on the non-redundant pairs mask[r, p] = occ[p] > occ[r].'''
     occ = occs[0] + occs[1]

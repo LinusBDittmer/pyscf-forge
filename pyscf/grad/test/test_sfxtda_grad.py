@@ -252,6 +252,39 @@ class KnownValues(unittest.TestCase):
                 xl = xo + sfxtda_grad._orbital_lagrangian(fock, vresp, mo, occs, zz, [], [])
                 self.assertLess(abs(xl - xl.T).max(), 1e-7)
 
+    def test_canonical_pz_degenerate(self):
+        import io
+        rng = np.random.default_rng(31)
+        spaces = (np.array([0, 1]), np.array([2, 3]), np.array([4, 5]))
+        eps = np.array([-1., -.5, -.2, -.1, .3, .3])            # virtuals 4, 5 degenerate
+        for a45, warned in ((1e-3, True), (1e-9, False)):
+            xo = rng.standard_normal((6, 6))
+            xo[4, 5], xo[5, 4] = a45, 0.
+            log = lib.logger.Logger(io.StringIO(), lib.logger.WARN)
+            pz = sfxtda_grad._canonical_pz(xo, eps, spaces, log)
+            self.assertEqual(pz[4, 5], 0)
+            self.assertAlmostEqual(pz[0, 1], -(xo[0, 1] - xo[1, 0]) / (2 * (eps[0] - eps[1])), 14)
+            self.assertAlmostEqual(abs(pz - pz.T).max(), 0, 14)
+            self.assertEqual(abs(pz[np.ix_([0, 1], [2, 3, 4, 5])]).max(), 0)   # no inter-space entries
+            self.assertEqual(abs(np.diag(pz)).max(), 0)
+            self.assertEqual('degenerate' in log.stdout.getvalue(), warned)
+
+    def test_z_vector_stationary_damped(self):
+        '''With Pz and the Z-vector, X^L - X^L^T vanishes on every pair, intra-space ones included.'''
+        for key in ('hf', 'ks'):
+            td = _td(MF[key], damping=(1., 8.))
+            mo = td.mo_coeff
+            for spin, state in ((0, 0), (1, 0)):
+                xo, fock, vresp, occs = _lagr(td, spin, state)[:4]
+                pz = sfxtda_grad._canonical_pz(xo, .5 * (fock[0] + fock[1]).diagonal(), td._orbs,
+                                               lib.logger.new_logger(td))
+                xo = xo + sfxtda_grad._orbital_lagrangian(fock, vresp, mo, occs, (pz / 2, pz / 2), [], [])
+                mask, hop, hdiag = sfxtda_grad._rohf_hessian(fock, vresp, mo, occs)
+                z = sfxtda_grad.solve_z(hop, hdiag, -(xo - xo.T)[mask], 1e-10, 100, lib.logger.new_logger(td))
+                zz = sfxtda_grad._z_densities(z, mask, occs)
+                xl = xo + sfxtda_grad._orbital_lagrangian(fock, vresp, mo, occs, zz, [], [])
+                self.assertLess(abs(xl - xl.T).max(), 1e-7)
+
     def test_fock_skeleton_vs_fd(self):
         rng = np.random.default_rng(13)
         for key in ('hf', 'hf_nodf', 'ks', 'cam'):

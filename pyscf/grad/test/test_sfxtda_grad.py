@@ -69,12 +69,12 @@ def _omega_at(td, mo, x, spin):
 
 def _lagr(td, spin, state):
     mf = td._scf
-    mo = mf.mo_coeff
+    mo = td.mo_coeff
     occs = sfxtda_grad._occupations(td)
     dfterms = sfxtda_grad._df_terms(td.mol, td._with_df.auxmol, mo, sfxtda._kernel_terms(*td.xc_coeffs))
     ghats = sfxtda_grad._two_body(td, td.xs[spin][state], spin, dfterms)
-    fock = sfxtda_grad._fock_mo(mf)
-    vresp = sfxtda_grad._uks_response(mf, *occs)
+    fock = sfxtda_grad._fock_mo(mf, mo)
+    vresp = sfxtda_grad._uks_response(mf, mo, *occs)
     p = sfxtda_grad._pdiff(td, spin, state)
     x = sfxtda_grad._orbital_lagrangian(fock, vresp, mo, occs, (p / 2, p / 2), dfterms, ghats)
     return x, fock, vresp, occs, dfterms, ghats, p
@@ -130,6 +130,23 @@ def _check_fd(test, key, states=STATES, tol=1e-6, full=False):
         test.assertLess(abs(_fd_dir(fun, mol, v) - np.einsum('nax,ax->n', de, v)).max(), tol)
 
 
+def _rotated(mf, seed, by_irrep=False):
+    '''Shallow copy of mf with orbitals randomly rotated inside C, O, V (inside each (space, irrep) if by_irrep):
+    the same ROKS state as another Roothaan matrix would deliver it.'''
+    rng = np.random.default_rng(seed)
+    mo = np.array(mf.mo_coeff)
+    lab = mf.mo_occ.astype(int)
+    if by_irrep:
+        orbsym = scf.hf_symm.get_orbsym(mf.mol, mf.mo_coeff)
+        lab = lab * 1000 + orbsym
+    for v in np.unique(lab):
+        idx = np.flatnonzero(lab == v)
+        mo[:, idx] = mo[:, idx] @ np.linalg.qr(rng.standard_normal((idx.size, idx.size)))[0]
+    mf2 = copy.copy(mf)
+    mf2.mo_coeff = lib.tag_array(mo, orbsym=orbsym) if by_irrep else mo
+    return mf2
+
+
 class KnownValues(unittest.TestCase):
     def test_df_terms_reproduce_omega(self):
         '''tr(P Fbar) + 1/2 sum_t <Ghat_t, T_t> == omega (own DF fit == with_df fit, S3).'''
@@ -145,7 +162,7 @@ class KnownValues(unittest.TestCase):
         rng = np.random.default_rng(11)
         for key in ('hf', 'ks', 'cam'):
             td = _td(MF[key])
-            mo = td._scf.mo_coeff
+            mo = td.mo_coeff
             core, somo, virt = td._orbs
             for spin, state in ((0, 0), (1, 0)):
                 xl = _lagr(td, spin, state)[0]
@@ -162,10 +179,10 @@ class KnownValues(unittest.TestCase):
         rng = np.random.default_rng(5)
         for key in ('hf', 'ks'):
             td = _td(MF[key])
-            mo = td._scf.mo_coeff
+            mo = td.mo_coeff
             occs = sfxtda_grad._occupations(td)
-            mask, hop, hdiag = sfxtda_grad._rohf_hessian(sfxtda_grad._fock_mo(td._scf),
-                                                         sfxtda_grad._uks_response(td._scf, *occs), mo, occs)
+            mask, hop, hdiag = sfxtda_grad._rohf_hessian(sfxtda_grad._fock_mo(td._scf, mo),
+                                                         sfxtda_grad._uks_response(td._scf, mo, *occs), mo, occs)
             n = np.count_nonzero(mask)
             jac = np.array([hop(e) for e in np.eye(n)]).T
             self.assertLess(abs(jac - jac.T).max(), 1e-7)
@@ -178,7 +195,7 @@ class KnownValues(unittest.TestCase):
         '''After the Z-vector solve, X^L - X^L^T vanishes on every orbital pair.'''
         for key in ('hf', 'ks', 'cam'):
             td = _td(MF[key])
-            mo = td._scf.mo_coeff
+            mo = td.mo_coeff
             for spin, state in ((0, 0), (1, 0)):
                 xo, fock, vresp, occs = _lagr(td, spin, state)[:4]
                 mask, hop, hdiag = sfxtda_grad._rohf_hessian(fock, vresp, mo, occs)
@@ -214,7 +231,7 @@ class KnownValues(unittest.TestCase):
         rng = np.random.default_rng(17)
         for key in ('hf', 'cam'):
             td = _td(MF[key])
-            mo = td._scf.mo_coeff
+            mo = td.mo_coeff
             terms = sfxtda._kernel_terms(*td.xc_coeffs)
             auxmol = td._with_df.auxmol
             x = td.xs[0][0]
@@ -255,6 +272,13 @@ class KnownValues(unittest.TestCase):
             res.append(td.nuc_grad_method().kernel(state=0, spin=1))
         self.assertAlmostEqual(abs(res[0] - res[1]).max(), 0, 7)
         self.assertAlmostEqual(abs(res[0][:, 0]).max(), 0, 8)
+
+    def test_grad_rotated_reference(self):
+        '''Reference orbitals rotated inside C, O, V give the same gradient (D5).'''
+        mf = _scf('hf', mol)
+        ref = _td(mf).nuc_grad_method().kernel(state=0, spin=1)
+        de = _td(_rotated(mf, 3)).nuc_grad_method().kernel(state=0, spin=1)
+        self.assertAlmostEqual(abs(de - ref).max(), 0, 7)
 
     def test_grad_hooks_and_errors(self):
         td = _td(MF['hf'])

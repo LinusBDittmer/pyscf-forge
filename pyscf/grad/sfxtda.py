@@ -58,15 +58,13 @@ def _occupations(td):
     return na, nb
 
 
-def _fock_mo(mf):
-    mo = mf.mo_coeff
+def _fock_mo(mf, mo):
     f = mf.get_fock()
     return numpy.array([mo.T @ f.focka @ mo, mo.T @ f.fockb @ mo])
 
 
-def _uks_response(mf, na, nb):
+def _uks_response(mf, mo, na, nb):
     # ROKS gen_response feeds the 2D ROHF mo_coeff/mo_occ to the UKS XC kernel (wrong density): pass UKS-shaped ones
-    mo = mf.mo_coeff
     return mf.gen_response(mo_coeff=(mo, mo), mo_occ=(na, nb), hermi=1)
 
 
@@ -234,7 +232,7 @@ def grad_elec(td_grad, spin, state, atmlst=None):
     td = td_grad.base
     mf = td._scf
     mol = td_grad.mol
-    mo = mf.mo_coeff
+    mo = td.mo_coeff
     if atmlst is None:
         atmlst = range(mol.natm)
     occs = _occupations(td)
@@ -245,8 +243,8 @@ def grad_elec(td_grad, spin, state, atmlst=None):
         auxmol = df.addons.make_auxmol(mol, td._with_df.auxbasis)
     dfterms = _df_terms(mol, auxmol, mo, sfxtda._kernel_terms(*td.xc_coeffs))
     ghats = _two_body(td, td.xs[spin][state], spin, dfterms)
-    fock = _fock_mo(mf)
-    vresp = _uks_response(mf, *occs)
+    fock = _fock_mo(mf, mo)
+    vresp = _uks_response(mf, mo, *occs)
     xo = _orbital_lagrangian(fock, vresp, mo, occs, (p / 2, p / 2), dfterms, ghats)
     mask, hop, hdiag = _rohf_hessian(fock, vresp, mo, occs)
     z = solve_z(hop, hdiag, -(xo - xo.T)[mask], td_grad.cphf_conv_tol, td_grad.cphf_max_cycle, log)

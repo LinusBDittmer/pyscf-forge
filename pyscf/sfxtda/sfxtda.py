@@ -40,6 +40,7 @@ from pyscf.ao2mo import _ao2mo
 from pyscf.data.nist import HARTREE2EV
 from pyscf.lib import logger
 from pyscf.tdscf._lr_eig import eigh as lr_eigh
+from pyscf.tdscf.rhf import _charge_center
 from pyscf.sfxtda._blocks import BLOCKS, ORDER, CSF_INFO
 from pyscf.sfxtda import _tdm
 
@@ -375,6 +376,8 @@ class SFXTDA(lib.StreamObject):
         transition_dm(spin, i, j) : dm[p,q] = <i|a+_q a_p|j> (PySCF fci convention), state density if i == j
         transition_dipole(spin, i) : <i|r|j> for every root j (origin at the nuclear charge centre)
         oscillator_strength(spin, i) : 2/3 (omega_j - omega_i) |<i|r|j>|^2 for every root j
+    Near-degenerate roots mix within their subspace depending on the Davidson convergence: their
+    individual TDMs and f are not well defined, only sums over the near-degenerate set are.
     '''
     conv_tol = 1e-5
     max_cycle = 100
@@ -536,8 +539,7 @@ class SFXTDA(lib.StreamObject):
         included and origin at the nuclear charge centre, as in pyscf.tdscf.'''
         x = self._roots(spin)
         mol = self.mol
-        charges = mol.atom_charges()
-        with mol.with_common_orig(numpy.einsum('z,zr->r', charges, mol.atom_coords()) / charges.sum()):
+        with mol.with_common_orig(_charge_center(mol)):
             ints = mol.intor_symmetric('int1e_r', comp=3)
         c = self._scf.mo_coeff
         ints = lib.einsum('xuv,up,vq->xpq', ints, c, c)

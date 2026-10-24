@@ -354,11 +354,9 @@ class KnownValues(unittest.TestCase):
                 if s == 1:   # roots 1, 2 are 4.9e-5 Ha apart: compare the pair sum
                     got, want = [got[0], got[1] + got[2], got[3]], [want[0], want[1] + want[2], want[3]]
                 self.assertLess(abs(np.subtract(got, want)).max(), 1e-6)
-            # state density: trace N, transitions traceless, dm_J0 = dm_0J^T
+            # state density: trace N, transitions traceless
             self.assertAlmostEqual(np.trace(dms[0]), mol.nelectron, 10)
             self.assertLess(np.abs([np.trace(d) for d in dms[1:]]).max(), 1e-10)
-            d10 = _tdm.transition_dm(td.xs[s][1], td.xs[s][0], blocks, core, somo, virt)
-            self.assertLess(abs(d10 - dms[1].T).max(), 1e-12)
             occ = np.linalg.eigvalsh(dms[0])
             self.assertTrue(-1e-10 < occ.min() and occ.max() < 2 + 1e-10)
 

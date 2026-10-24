@@ -29,7 +29,8 @@ basis.  Every matrix element is taken from the generated formulas in _blocks.py.
 integrals are density fitted (PySCF's full-range and erf/erfc fits stacked, with a sign per
 auxiliary function) and no N^4 quantity is built: the blocks that touch an OO/CO/OV CSF are stored
 explicitly (at most N^3), the CV-CV block is applied as a sigma vector through one-index operators
-and DF J/K contractions.
+and DF J/K contractions.  Transition density matrices, transition dipoles and oscillator strengths
+between roots of the same spin are contracted from the CSF coupling coefficients in _tdm.py.
 '''
 
 import contextlib
@@ -40,6 +41,7 @@ from pyscf.data.nist import HARTREE2EV
 from pyscf.lib import logger
 from pyscf.tdscf._lr_eig import eigh as lr_eigh
 from pyscf.sfxtda._blocks import BLOCKS, ORDER, CSF_INFO
+from pyscf.sfxtda import _tdm
 
 # axis of each C/V label in the broadcast shape (bra i, bra a, ket j, ket b)
 _AX = {'i': 0, 'a': 1, 'j': 2, 'b': 3}
@@ -368,6 +370,11 @@ class SFXTDA(lib.StreamObject):
         irrep : irrep label of each root
         converged : convergence flag of each root
         xs : eigenvectors in the CSF basis, shape (nroots, n)
+
+    Properties (between roots of one spin; the operators are spin-free):
+        transition_dm(spin, i, j) : dm[p,q] = <i|a+_q a_p|j> (PySCF fci convention), state density if i == j
+        transition_dipole(spin, i) : <i|r|j> for every root j (origin at the nuclear charge centre)
+        oscillator_strength(spin, i) : 2/3 (omega_j - omega_i) |<i|r|j>|^2 for every root j
     '''
     conv_tol = 1e-5
     max_cycle = 100
@@ -506,6 +513,43 @@ class SFXTDA(lib.StreamObject):
         x0[numpy.arange(idx.size), idx] = 1
         return x0, (None if x_sym is None else x_sym[idx])
 
+    def _roots(self, spin):
+        if self.xs is None:
+            raise RuntimeError('run kernel() first')
+        if spin not in self.xs:
+            raise ValueError(f'spin {spin} was not computed (spins = {self.spins})')
+        return self.xs[spin]
+
+    def transition_dm(self, spin, i, j, ao_repr=False):
+        '''One-particle transition density matrix dm[p,q] = <i|a+_q a_p|j> between roots i, j of spin S
+        (MO basis, or AO basis if ao_repr).  i == j gives the (unrelaxed) state density.'''
+        x = self._roots(spin)
+        core, somo, virt = self._orbs
+        dm = _tdm.transition_dm(x[i], x[j], csf_list(spin, len(core), len(virt)), core, somo, virt)
+        if ao_repr:
+            c = self._scf.mo_coeff
+            dm = c @ dm @ c.T
+        return dm
+
+    def transition_dipole(self, spin=0, i=0):
+        '''<i|r|j> for every root j of spin S, shape (nroots, 3).  Length gauge, electron charge not
+        included and origin at the nuclear charge centre, as in pyscf.tdscf.'''
+        x = self._roots(spin)
+        mol = self.mol
+        charges = mol.atom_charges()
+        with mol.with_common_orig(numpy.einsum('z,zr->r', charges, mol.atom_coords()) / charges.sum()):
+            ints = mol.intor_symmetric('int1e_r', comp=3)
+        c = self._scf.mo_coeff
+        ints = lib.einsum('xuv,up,vq->xpq', ints, c, c)
+        return numpy.array([numpy.einsum('xpq,qp->x', ints, self.transition_dm(spin, i, j))
+                            for j in range(len(x))]).reshape(-1, 3)
+
+    def oscillator_strength(self, spin=0, i=0):
+        '''f_j = 2/3 (omega_j - omega_i) |<i|r|j>|^2 for every root j of spin S (negative below root i).'''
+        mu = self.transition_dipole(spin, i)
+        w = self.omega[spin]
+        return 2. / 3. * (w - w[i]) * (mu**2).sum(1)
+
     def kernel(self, nstates=None):
         cpu0 = (logger.process_clock(), logger.perf_counter())
         if not set(self.spins) <= {0, 1, 2}:
@@ -570,11 +614,15 @@ class SFXTDA(lib.StreamObject):
 
     def _finalize(self):
         log = logger.new_logger(self)
+        log.note('f: oscillator strength from the lowest root of the same spin')
         for spin in self.spins:
             if not all(self.converged[spin]):
                 log.warn('SF-XTDA S=%d roots %s not converged', spin,
                          numpy.flatnonzero(~self.converged[spin]).tolist())
+            if not len(self.omega[spin]):
+                continue
+            f = self.oscillator_strength(spin)
             for k, (w, e, g) in enumerate(zip(self.omega[spin], self.e[spin], self.irrep[spin])):
-                log.note('S=%d  root %2d  %-4s  omega = %10.4f eV  e = %10.4f eV',
-                         spin, k, g, w * HARTREE2EV, e * HARTREE2EV)
+                log.note('S=%d  root %2d  %-4s  omega = %10.4f eV  e = %10.4f eV  f = %8.4f',
+                         spin, k, g, w * HARTREE2EV, e * HARTREE2EV, f[k])
         return self

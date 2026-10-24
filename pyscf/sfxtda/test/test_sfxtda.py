@@ -362,6 +362,47 @@ class KnownValues(unittest.TestCase):
             occ = np.linalg.eigvalsh(dms[0])
             self.assertTrue(-1e-10 < occ.min() and occ.max() < 2 + 1e-10)
 
+    def test_oscillator_strength_vs_detci(self):
+        td = sfxtda.SFXTDA(mf_hf, nstates=4, spins=(0, 1, 2))
+        td.conv_tol = 1e-9
+        td.kernel()
+        ref = {  # frozen determinant CI: f_0J and |mu_0J|^2 (charge-centre origin), J = 0..3
+            0: ([0., 0.00038228, 0.00545734, 0.02123599], [0.03146087, 0.08754974, 0.11005096]),
+            1: ([0., 0.00165178, 0.00143328, 0.00022458], [0.00799955, 0.00694023, 0.00103085]),
+            2: ([0., 0.03560197, 0.28409064, 0.00078773], [0.6173691, 1.6425702, 0.00345483])}
+        omega = {0: [0.0535131769, 0.0717394227, 0.1470143867, 0.3429608363],
+                 1: [-0.0076931411, 0.3020335937, 0.3020826064, 0.3190914264],
+                 2: [0.4082409828, 0.4947418341, 0.6676734031, 0.7502526393]}
+        for s in (0, 1, 2):
+            self.assertLess(abs(td.omega[s] - omega[s]).max(), 1e-8)
+            f = td.oscillator_strength(s)
+            mu2 = (td.transition_dipole(s)[1:]**2).sum(1)
+            if s == 1:   # near-degenerate roots 1, 2: pair sums
+                f, mu2 = [f[0], f[1] + f[2], f[3]], [mu2[0] + mu2[1], mu2[2]]
+                fr, mr = ref[s][0], ref[s][1]
+                fr, mr = [fr[0], fr[1] + fr[2], fr[3]], [mr[0] + mr[1], mr[2]]
+            else:
+                fr, mr = ref[s]
+            self.assertLess(abs(np.subtract(f, fr)).max(), 1e-7)
+            self.assertLess(abs(np.subtract(mu2, mr)).max(), 1e-6)
+        # f from root i: zero on the diagonal, antisymmetric energy factor
+        f1 = td.oscillator_strength(0, i=1)
+        self.assertEqual(f1[1], 0)
+        self.assertAlmostEqual(f1[0], -td.oscillator_strength(0)[1], 10)
+
+    def test_transition_dm_api(self):
+        td = sfxtda.SFXTDA(mf_ks, nstates=3, spins=(0,))
+        with self.assertRaises(RuntimeError):
+            td.transition_dm(0, 0, 1)
+        td.kernel()
+        with self.assertRaises(ValueError):
+            td.transition_dipole(spin=1)
+        c = mf_ks.mo_coeff
+        dm = td.transition_dm(0, 0, 1)
+        self.assertLess(abs(td.transition_dm(0, 0, 1, ao_repr=True) - c @ dm @ c.T).max(), 1e-12)
+        self.assertAlmostEqual(np.einsum('pq,qp->', mf_ks.get_ovlp(), td.transition_dm(0, 1, 1, ao_repr=True)),
+                               mol.nelectron, 8)
+
 if __name__ == "__main__":
     print("Full Tests for SF-XTDA")
     unittest.main()

@@ -42,7 +42,7 @@ Only the undamped model is supported; grid response of the XC terms is omitted (
 
 import types
 import numpy
-from pyscf import lib, df, dft
+from pyscf import lib, gto, df, dft
 from pyscf.lib import logger
 from pyscf.df.grad import rhf as df_grad
 from pyscf.grad import rhf as rhf_grad
@@ -339,6 +339,38 @@ class Gradients(rhf_grad.GradientsBase):
             logger.note(self, '--------- SF-XTDA gradients for S=%d root %d ----------', self.spin, self.state)
             self._write(self.mol, self.de, self.atmlst)
             logger.note(self, '----------------------------------------------')
+
+    def as_scanner(self, state=None, spin=None):
+        '''Scanner: scanner(mol_or_geom) returns (e_tot, de) of the root (spin, state), tracked by index.'''
+        if isinstance(self, lib.GradScanner):
+            return self
+        logger.info(self, 'Create scanner for %s', self.__class__)
+        name = self.__class__.__name__ + SFXTDA_GradScanner.__name_mixin__
+        return lib.set_class(SFXTDA_GradScanner(self, state, spin), (SFXTDA_GradScanner, self.__class__), name)
+
+
+class SFXTDA_GradScanner(lib.GradScanner):
+    def __init__(self, g, state=None, spin=None):
+        lib.GradScanner.__init__(self, g)
+        if state is not None:
+            self.state = state
+        if spin is not None:
+            self.spin = spin
+
+    def __call__(self, mol_or_geom, state=None, spin=None, **kwargs):
+        if isinstance(mol_or_geom, gto.MoleBase):
+            mol = mol_or_geom
+        else:
+            mol = self.mol.set_geom_(mol_or_geom, inplace=False)
+        self.reset(mol)
+        self.base(mol)
+        de = self.kernel(state=state, spin=spin, **kwargs)
+        return self.base.e_tot[self.spin][self.state], de
+
+    @property
+    def converged(self):
+        td = self.base
+        return bool(td._scf.converged and td.converged[self.spin][self.state])
 
 
 Grad = Gradients

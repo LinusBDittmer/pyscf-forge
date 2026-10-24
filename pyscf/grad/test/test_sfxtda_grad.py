@@ -283,6 +283,27 @@ class KnownValues(unittest.TestCase):
         g.kernel(state=1, spin=1)
         self.assertIn('near-degenerate', g.stdout.getvalue())
 
+    def test_grad_scanner(self):
+        coords2 = mol.atom_coords() + np.array([[0, 0, .03], [0, .02, 0], [.01, 0, -.02]])
+        coords3 = mol.atom_coords() - .02
+        scanner = _td(MF['hf']).nuc_grad_method().as_scanner(state=1, spin=0)
+        e2, de2 = scanner(mol.set_geom_(coords2, unit='Bohr', inplace=False))
+        self.assertTrue(scanner.converged)
+        scanner(coords3 * lib.param.BOHR)                # array path: coordinates in mol.unit (Angstrom)
+        e2b, de2b = scanner(mol.set_geom_(coords2, unit='Bohr', inplace=False))
+        mol2 = mol.set_geom_(coords2, unit='Bohr', inplace=False)
+        td2 = _td(MAKE['hf'](mol2).run(conv_tol=1e-12, conv_tol_grad=1e-10))
+        ref = td2.nuc_grad_method().kernel(state=1, spin=0)
+        self.assertAlmostEqual(e2, td2.e_tot[0][1], 8)
+        self.assertAlmostEqual(abs(de2 - ref).max(), 0, 6)
+        self.assertAlmostEqual(abs(de2b - ref).max(), 0, 6)
+
+    @unittest.skipUnless(__import__('importlib').util.find_spec('geometric'), 'geomeTRIC not installed')
+    def test_optimizer_hook(self):
+        from pyscf.geomopt import geometric_solver
+        opt = _td(MF['hf']).nuc_grad_method().optimizer()
+        self.assertIsInstance(opt, geometric_solver.GeometryOptimizer)
+
 
 if __name__ == "__main__":
     print("Full Tests for SF-XTDA gradients")

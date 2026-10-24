@@ -47,7 +47,7 @@ from pyscf.lib import logger
 from pyscf.df.grad import rhf as df_grad
 from pyscf.grad import rhf as rhf_grad
 from pyscf.grad import tduks as tduks_grad
-from pyscf.sfxtda import sfxtda, _rdm2
+from pyscf.sfxtda import sfxtda, _rdm2, _tdm
 
 
 def _occupations(td):
@@ -95,6 +95,42 @@ def _two_body(td, x, spin, dfterms):
     core, somo, virt = td._orbs
     blocks = sfxtda.csf_list(spin, len(core), len(virt))
     return [2 * c * _rdm2.contract(x, blocks, d, core, somo, virt) for c, _, _, d in dfterms]
+
+
+def _damping_weights(x, hss, hsl, d_small, d_large, p1, p2):
+    '''dW of the damped Rayleigh quotient (undamped hss, hsl): d omega = sum (x x^T + dW) dH.
+
+    Returns (wss, wsl, gs, gl) with dW_ss = wss + diag(gs), dW_sl = wsl, dW_ll = diag(gl).
+    '''
+    ns = hss.shape[0]
+    xs, xl = x[:ns], x[ns:]
+    fss, fsl = sfxtda.damping_factors(d_small, d_large, p1, p2)
+    # ponytail: about four (ns, nl) arrays live at once, the size of hsl; block over large columns if memory matters
+    a_ss = numpy.outer(xs, xs) * hss * fss * (-4 * p2 * (d_small[:, None] - d_small[None, :])**3)
+    a_sl = numpy.outer(xs, xl) * hsl * fsl * (-4 * p2 * (d_small[:, None] - d_large[None, :])**3)
+    gs = 2 * (a_ss.sum(1) + a_sl.sum(1))
+    gl = -2 * a_sl.sum(0)
+    return numpy.outer(xs, xs) * (fss - 1), numpy.outer(xs, xl) * (fsl - 1), gs, gl
+
+
+def _state_densities(td, spin, state, dfterms):
+    '''P (MO) and Ghat_t of root `state`: x x^T, plus the damping weight dW if td.damping is set.'''
+    x = td.xs[spin][state]
+    p = _pdiff(td, spin, state)
+    ghats = _two_body(td, x, spin, dfterms)
+    if td.damping is None:
+        return p, ghats
+    ints = td._ints
+    core, somo, virt = td._orbs
+    blocks = sfxtda.csf_list(spin, len(core), len(virt))
+    hss, hsl = sfxtda.build_small(ints, spin)
+    hdl = sfxtda.hdiag_large(ints, *sfxtda.cvcv_operator(ints, spin))
+    wss, wsl, gs, gl = _damping_weights(x, hss, hsl, hss.diagonal().copy(), hdl.ravel(), *td.damping)
+    wss = wss + numpy.diag(gs)
+    p = p + _tdm.weighted_dm(wss, wsl, gl, blocks, core, somo, virt)
+    ghats = [g + 2 * c * _rdm2.contract_weighted(wss, wsl, gl, blocks, d, core, somo, virt)
+             for g, (c, _, _, d) in zip(ghats, dfterms)]
+    return p, ghats
 
 
 def _orbital_lagrangian(fock, vresp, mo, occs, q, dfterms, ghats):

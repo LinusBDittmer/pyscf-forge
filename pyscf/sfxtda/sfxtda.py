@@ -342,17 +342,23 @@ def k_contract(ints, t):
     return lib.dot(x, ints.bvv.reshape(naux * nV, nV))
 
 
+def damping_factors(d_small, d_large, p1, p2):
+    '''Damping factors p1*exp(-p2*(H_KK-H_LL)^4): small-small (unit diagonal) and small-large.'''
+    fss = p1 * numpy.exp(-p2 * (d_small[:, None] - d_small[None, :])**4)
+    numpy.fill_diagonal(fss, 1.)
+    fsl = numpy.subtract(d_small[:, None], d_large[None, :])
+    fsl **= 4
+    fsl *= -p2
+    numpy.exp(fsl, out=fsl)
+    fsl *= p1
+    return fss, fsl
+
+
 def damp_(hss, hsl, d_small, d_large, p1, p2):
     '''In-place damping p1*exp(-p2*(H_KK-H_LL)^4) of the off-diagonal of hss and of all of hsl.'''
-    f = p1 * numpy.exp(-p2 * (d_small[:, None] - d_small[None, :])**4)
-    numpy.fill_diagonal(f, 1.)
-    hss *= f
-    f = numpy.subtract(d_small[:, None], d_large[None, :])
-    f **= 4
-    f *= -p2
-    numpy.exp(f, out=f)
-    f *= p1
-    hsl *= f
+    fss, fsl = damping_factors(d_small, d_large, p1, p2)
+    hss *= fss
+    hsl *= fsl
 
 
 def csf_irreps(blocks, orbsym, core, somo, virt):

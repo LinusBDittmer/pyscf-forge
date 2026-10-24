@@ -41,8 +41,8 @@ def tearDownModule():
     global mol, MF
     del mol, MF
 
-def _td(mf, nstates=3):
-    td = sfxtda.SFXTDA(mf, nstates=nstates, spins=(0, 1, 2))
+def _td(mf, nstates=3, damping=None):
+    td = sfxtda.SFXTDA(mf, nstates=nstates, spins=(0, 1, 2), damping=damping)
     td.conv_tol = 1e-7                 # well above the Davidson residual floor (~1e-9, S6)
     td.kernel()
     return td
@@ -72,10 +72,9 @@ def _lagr(td, spin, state):
     mo = td.mo_coeff
     occs = sfxtda_grad._occupations(td)
     dfterms = sfxtda_grad._df_terms(td.mol, td._with_df.auxmol, mo, sfxtda._kernel_terms(*td.xc_coeffs))
-    ghats = sfxtda_grad._two_body(td, td.xs[spin][state], spin, dfterms)
+    p, ghats = sfxtda_grad._state_densities(td, spin, state, dfterms)
     fock = sfxtda_grad._fock_mo(mf, mo)
     vresp = sfxtda_grad._uks_response(mf, mo, *occs)
-    p = sfxtda_grad._pdiff(td, spin, state)
     x = sfxtda_grad._orbital_lagrangian(fock, vresp, mo, occs, (p / 2, p / 2), dfterms, ghats)
     return x, fock, vresp, occs, dfterms, ghats, p
 
@@ -147,6 +146,13 @@ def _rotated(mf, seed, by_irrep=False):
     return mf2
 
 
+def _dense_w(wss, wsl, gl):
+    ns, nl = wsl.shape
+    w = np.zeros((ns + nl, ns + nl))
+    w[:ns, :ns], w[:ns, ns:], w[ns:, :ns] = wss, wsl, wsl.T
+    w[ns:, ns:] += np.diag(gl)
+    return w
+
 class KnownValues(unittest.TestCase):
     def test_df_terms_reproduce_omega(self):
         '''tr(P Fbar) + 1/2 sum_t <Ghat_t, T_t> == omega (own DF fit == with_df fit, S3).'''
@@ -174,6 +180,48 @@ class KnownValues(unittest.TestCase):
                 asym = xl - xl.T
                 for sp in (core, somo, virt):                 # redundant rotations: invariance
                     self.assertLess(abs(asym[np.ix_(sp, sp)]).max(), 1e-8)
+
+    def test_damping_weights_vs_fd(self):
+        '''d omega/d lam of the lowest root of damped(H + lam V) == sum (x x^T + dW) V (toy matrices, F1).'''
+        rng = np.random.default_rng(29)
+        ns, nl, damping = 6, 11, (0.9, 8.0)
+        h = .3 * rng.standard_normal((ns + nl, ns + nl))
+        h += h.T
+        h[np.diag_indices(ns + nl)] = rng.uniform(0, .8, ns + nl)
+        v = rng.standard_normal(h.shape)
+        v += v.T
+
+        def damped(m):
+            hss, hsl = m[:ns, :ns].copy(), m[:ns, ns:].copy()
+            sfxtda.damp_(hss, hsl, hss.diagonal().copy(), m.diagonal()[ns:].copy(), *damping)
+            out = m.copy()
+            out[:ns, :ns], out[:ns, ns:], out[ns:, :ns] = hss, hsl, hsl.T
+            return out
+        x = np.linalg.eigh(damped(h))[1][:, 0]
+        wss, wsl, gs, gl = sfxtda_grad._damping_weights(x, h[:ns, :ns], h[:ns, ns:], h.diagonal()[:ns],
+                                                        h.diagonal()[ns:], *damping)
+        w = np.outer(x, x) + _dense_w(wss + np.diag(gs), wsl, gl)
+        lam = 1e-5
+        fd = (np.linalg.eigvalsh(damped(h + lam * v))[0] - np.linalg.eigvalsh(damped(h - lam * v))[0]) / (2 * lam)
+        self.assertAlmostEqual(fd, np.sum(w * v), delta=1e-8)
+        self.assertAlmostEqual(gs.sum() + gl.sum(), 0, 12)
+
+    def test_orbital_lagrangian_damped_vs_fd(self):
+        '''X^omega of the damped model vs FD of x.Htilde(U).x (x fixed); intra-space rotations now contribute.'''
+        rng = np.random.default_rng(11)
+        for key in ('hf', 'ks', 'cam'):
+            td = _td(MF[key], damping=(1., 8.))
+            mo = td.mo_coeff
+            core, somo, virt = td._orbs
+            for spin, state in ((0, 0), (1, 0)):
+                xl = _lagr(td, spin, state)[0]
+                k = rng.standard_normal(xl.shape) * 1e-5
+                k -= k.T
+                x = td.xs[spin][state]
+                fd = (_omega_at(td, mo @ expm(k), x, spin) - _omega_at(td, mo @ expm(-k), x, spin)) / 2
+                self.assertAlmostEqual(fd, np.sum(xl * k), delta=1e-11)
+                asym = xl - xl.T
+                self.assertGreater(max(abs(asym[np.ix_(sp, sp)]).max() for sp in (core, somo, virt)), 1e-6)
 
     def test_rohf_hessian_vs_fd(self):
         rng = np.random.default_rng(5)

@@ -286,7 +286,8 @@ class KnownValues(unittest.TestCase):
     def test_grad_scanner(self):
         coords2 = mol.atom_coords() + np.array([[0, 0, .03], [0, .02, 0], [.01, 0, -.02]])
         coords3 = mol.atom_coords() - .02
-        scanner = _td(MF['hf']).nuc_grad_method().as_scanner(state=1, spin=0)
+        # own SCF: the SCF scanner shares (and rebuilds) with_df with the object it was made from
+        scanner = _td(_scf('hf', mol)).nuc_grad_method().as_scanner(state=1, spin=0)
         e2, de2 = scanner(mol.set_geom_(coords2, unit='Bohr', inplace=False))
         self.assertTrue(scanner.converged)
         scanner(coords3 * lib.param.BOHR)                # array path: coordinates in mol.unit (Angstrom)

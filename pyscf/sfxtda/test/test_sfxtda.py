@@ -362,6 +362,22 @@ class KnownValues(unittest.TestCase):
             occ = np.linalg.eigvalsh(dms[0])
             self.assertTrue(-1e-10 < occ.min() and occ.max() < 2 + 1e-10)
 
+    def test_tdm_direction(self):
+        # E_rs vs E_sr of every table entry: <X^T, dm(u, v)> for a non-symmetric X and random CSF vectors
+        # (regression freeze, validated against determinant CI in the full CSF space); MO signs made canonical
+        mf = mf_hf.copy()
+        c = mf_hf.mo_coeff
+        mf.mo_coeff = c * np.sign(c[abs(c).argmax(0), np.arange(c.shape[1])])
+        td = sfxtda.SFXTDA(mf).build()
+        core, somo, virt = td._orbs
+        rng = np.random.default_rng(3)
+        x = rng.standard_normal((c.shape[1],) * 2)
+        for s, ref in zip((0, 1, 2), (-78.11584436, -25.77943742, -0.51561271)):
+            blocks = sfxtda.csf_list(s, len(core), len(virt))
+            u, v = rng.standard_normal((2, sum(r * q for _, _, (r, q) in blocks)))
+            dm = _tdm.transition_dm(u, v, blocks, core, somo, virt)
+            self.assertAlmostEqual(np.einsum('rs,sr->', x, dm), ref, 7)
+
     def test_oscillator_strength_vs_detci(self):
         td = sfxtda.SFXTDA(mf_hf, nstates=4, spins=(0, 1, 2))
         td.conv_tol = 1e-9

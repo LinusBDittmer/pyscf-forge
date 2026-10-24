@@ -35,7 +35,7 @@ between roots of the same spin are contracted from the CSF coupling coefficients
 
 import contextlib
 import numpy
-from pyscf import lib, scf, dft, df, symm
+from pyscf import lib, gto, scf, dft, df, symm
 from pyscf.ao2mo import _ao2mo
 from pyscf.data.nist import HARTREE2EV
 from pyscf.lib import logger
@@ -397,6 +397,7 @@ class SFXTDA(lib.StreamObject):
         self.auxbasis = None
         self._ints = None
         self._orbs = None
+        self._with_df = None
         self.omega = self.e = self.e_tot = self.irrep = self.converged = self.xs = None
 
     def dump_flags(self, verbose=None):
@@ -421,6 +422,7 @@ class SFXTDA(lib.StreamObject):
             with_df = df.DF(self.mol, auxbasis=self.auxbasis)
             with_df.max_memory = self.max_memory
         terms = _kernel_terms(*xc_coeffs)
+        self._with_df = with_df
         self._ints = ints = _DFInts(with_df, mo_coeff, core, somo, virt, fbar, terms)
         self._orbs = (core, somo, virt)
         self.xc_coeffs = xc_coeffs
@@ -430,6 +432,22 @@ class SFXTDA(lib.StreamObject):
         if mem > self.max_memory:
             log.warn('DF tensors (%.1f MB) exceed max_memory (%d MB)', mem, self.max_memory)
         return self
+
+    def reset(self, mol=None):
+        if mol is not None:
+            self.mol = mol
+        self._scf.reset(mol)
+        self._ints = self._orbs = self._with_df = None
+        self.omega = self.e = self.e_tot = self.irrep = self.converged = self.xs = None
+        return self
+
+    def as_scanner(self):
+        '''Scanner: scanner(mol_or_geom) returns e_tot (dict spin -> array) at the new geometry.'''
+        if isinstance(self, lib.SinglePointScanner):
+            return self
+        logger.info(self, 'Set %s as a scanner', self.__class__)
+        name = self.__class__.__name__ + SFXTDA_Scanner.__name_mixin__
+        return lib.set_class(SFXTDA_Scanner(self), (SFXTDA_Scanner, self.__class__), name)
 
     def gen_vind(self, spin):
         '''Sigma-vector function vind(x) for x of shape (m, n) and the exact diagonal hdiag (n,).'''
@@ -595,7 +613,7 @@ class SFXTDA(lib.StreamObject):
                                   max_memory=self.max_memory, verbose=log)
             xs = numpy.asarray(xs)
             self.omega[spin] = numpy.asarray(w)
-            self.converged[spin] = numpy.asarray(conv)
+            self.converged[spin] = _check_roots(xs, numpy.asarray(conv), log)
             self.xs[spin] = xs
             self.e_tot[spin] = self._scf.e_tot + self.omega[spin]
             if x_sym is None:
@@ -628,3 +646,35 @@ class SFXTDA(lib.StreamObject):
                 log.note('S=%d  root %2d  %-4s  omega = %10.4f eV  e = %10.4f eV  f = %8.4f',
                          spin, k, g, w * HARTREE2EV, e * HARTREE2EV, f[k])
         return self
+
+
+def _check_roots(xs, conv, log):
+    '''Flag roots with non-normalised vectors as unconverged.
+
+    pyscf.tdscf._lr_eig.eigh orthogonalises with one classical Gram-Schmidt pass and never
+    re-orthonormalises; when the subspace fills a small CSF space it collapses and returns
+    near-zero vectors with omega ~ 0.
+    '''
+    conv = numpy.array(conv, dtype=bool)
+    bad = numpy.flatnonzero(abs(numpy.linalg.norm(xs, axis=1) - 1) > 1e-6)
+    if bad.size:
+        conv[bad] = False
+        log.warn('SF-XTDA roots %s: non-normalised eigenvectors (Davidson subspace collapse, see conv_tol); '
+                 'results invalid', bad.tolist())
+    return conv
+
+
+class SFXTDA_Scanner(lib.SinglePointScanner):
+    def __init__(self, td):
+        self.__dict__.update(td.__dict__)
+        self._scf = td._scf.as_scanner()
+
+    def __call__(self, mol_or_geom, **kwargs):
+        if isinstance(mol_or_geom, gto.MoleBase):
+            mol = mol_or_geom
+        else:
+            mol = self.mol.set_geom_(mol_or_geom, inplace=False)
+        self.reset(mol)
+        self._scf(mol)
+        self.kernel(**kwargs)
+        return self.e_tot

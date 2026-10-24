@@ -417,6 +417,33 @@ class KnownValues(unittest.TestCase):
         self.assertAlmostEqual(np.einsum('pq,qp->', mf_ks.get_ovlp(), td.transition_dm(0, 1, 1, ao_repr=True)),
                                mol.nelectron, 8)
 
+    def test_root_guard(self):
+        '''Non-normalised Davidson vectors (subspace collapse, S6) are flagged unconverged.'''
+        xs = np.eye(3, 5)
+        xs[1] = 1e-8
+        conv = sfxtda._check_roots(xs, np.ones(3, dtype=bool), lib.logger.new_logger(mf_hf))
+        self.assertEqual(conv.tolist(), [True, False, True])
+
+    def test_energy_scanner(self):
+        mol2 = gto.M(atom="C 0 0 0.05; H 0.1 1.02 0.5; H -0.2 -0.95 0.33", basis='6-31g', spin=2, verbose=0)
+        for make in (lambda m: scf.ROHF(m).density_fit(), lambda m: scf.ROHF(m)):
+            td = sfxtda.SFXTDA(make(mol).run(conv_tol=1e-11), nstates=3)
+            scanner = td.as_scanner()
+            e = scanner(mol2)
+            ref = sfxtda.SFXTDA(make(mol2).run(conv_tol=1e-11), nstates=3)
+            ref.kernel()
+            for s in (0, 1):
+                self.assertAlmostEqual(abs(e[s] - ref.e_tot[s]).max(), 0, 7)
+            self.assertIs(scanner._with_df.mol, mol2)       # no stale DF tensors / auxmol
+
+    def test_reset_clears(self):
+        td = sfxtda.SFXTDA(scf.ROHF(mol).density_fit().run(conv_tol=1e-11), nstates=2)
+        td.kernel()
+        self.assertIsNotNone(td._with_df)
+        td.reset()
+        for attr in ('_ints', '_orbs', '_with_df', 'xs', 'omega', 'e_tot'):
+            self.assertIsNone(getattr(td, attr))
+
 if __name__ == "__main__":
     print("Full Tests for SF-XTDA")
     unittest.main()

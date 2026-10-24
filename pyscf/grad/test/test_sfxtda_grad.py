@@ -103,19 +103,19 @@ def _scf(key, mol2, grids=None, dm0=None):
         mf2.grids = grids
     return mf2.run(dm0, conv_tol=1e-12, conv_tol_grad=1e-10)
 
-def _e_states(key, mol2, grids, dm0, states=STATES):
-    td = _td(_scf(key, mol2, grids, dm0))
+def _e_states(key, mol2, grids, dm0, states=STATES, damping=None):
+    td = _td(_scf(key, mol2, grids, dm0), damping=damping)
     return np.array([td.e_tot[s][k] for s, k in states])
 
-def _check_fd(test, key, states=STATES, tol=1e-6, full=False):
+def _check_fd(test, key, states=STATES, tol=1e-6, full=False, damping=None):
     mf = MF[key]
-    td = _td(mf)
+    td = _td(mf, damping=damping)
     for s, k in states:                           # roots well separated -> FD follows the same root
         w = td.omega[s]
         test.assertGreater(min(abs(w[k] - w[j]) for j in range(len(w)) if j != k), 1e-3)
     grids = _frozen(mf.grids) if hasattr(mf, 'grids') else None
     dm0 = mf.make_rdm1()
-    fun = lambda m2: _e_states(key, m2, grids, dm0, states)
+    fun = lambda m2: _e_states(key, m2, grids, dm0, states, damping)
     g = td.nuc_grad_method()
     de = np.array([g.kernel(state=k, spin=s) for s, k in states])
     if full:
@@ -344,6 +344,23 @@ class KnownValues(unittest.TestCase):
     def test_grad_vs_fd_rsh_slow(self):
         _check_fd(self, 'cam', tol=1e-5)
 
+    def test_grad_damped_vs_fd_direction(self):
+        for key, damping in (('hf', (0.9, 5.0)), ('hf_nodf', (1., 8.)), ('ks', (1., 8.)), ('pbe', (1., 8.))):
+            _check_fd(self, key, damping=damping)
+
+    def test_grad_damped_vs_fd_rsh_slow(self):
+        _check_fd(self, 'cam', tol=1e-5, damping=(1., 8.))
+
+    def test_grad_damped_symmetry(self):
+        atom = "C 0 0 0; H 0 0.95 0.55; H 0 -0.95 0.55"
+        res = []
+        for sym in (True, False):
+            m = gto.M(atom=atom, basis='6-31g', spin=2, symmetry=sym, verbose=0)
+            td = _td(scf.ROHF(m).density_fit().run(conv_tol=1e-12, conv_tol_grad=1e-10), damping=(1., 8.))
+            res.append(td.nuc_grad_method().kernel(state=0, spin=1))
+        self.assertAlmostEqual(abs(res[0] - res[1]).max(), 0, 7)
+        self.assertAlmostEqual(abs(res[0][:, 0]).max(), 0, 8)
+
     def test_grad_symmetry(self):
         atom = "C 0 0 0; H 0 0.95 0.55; H 0 -0.95 0.55"
         res = []
@@ -370,9 +387,6 @@ class KnownValues(unittest.TestCase):
         td1 = sfxtda.SFXTDA(MF['hf'], spins=(1,))
         with self.assertRaises(ValueError):
             td1.nuc_grad_method().kernel(spin=0)
-        tdd = sfxtda.SFXTDA(MF['hf'], damping=(1., 8.))
-        with self.assertRaises(NotImplementedError):
-            tdd.nuc_grad_method().kernel()
         mfn = dft.ROKS(mol, xc='B3LYP')
         mfn.nlc = 'vv10'                         # do_nlc() only recognises the lower-case value
         with self.assertRaises(NotImplementedError):

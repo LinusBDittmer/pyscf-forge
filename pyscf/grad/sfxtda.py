@@ -37,7 +37,16 @@ non-redundant pairs (VC, VO, OC) gives Z_t; Q_t = P/2 + Z_t, W = (X^L + X^L^T)/4
 
     dE/dA = dE_ROKS/dA + d/dA sum_t tr(Q_t F_t[D])|skeleton + own DF derivative - tr(W_AO S^(A)).
 
-Only the undamped model is supported; grid response of the XC terms is omitted (as in pyscf.grad.tduks).
+Damping (td.damping = (p1, p2)): omega = x.Htilde.x with Htilde_KL = f_KL H_KL on pairs touching a small CSF,
+f_KL = p1 exp(-p2 (d_K - d_L)^4), d_K = H_KK.  Then d omega = sum W_KL dH_KL with W = x x^T + dW,
+
+    dW_ss = x_s x_s^T o (f_ss - 1) + diag(g_s),   dW_sl = x_s x_l^T o (f_sl - 1),   dW_ll = diag(g_l),
+    g_K = 2 sum_L a_KL,   a_KL = x_K x_L H_KL f_KL (-4 p2 (d_K - d_L)^3),
+
+contracted into P and Ghat_t by _tdm.weighted_dm and _rdm2.contract_weighted.  The d_K are not invariant under
+rotations inside C, O and V; td.mo_coeff fixes them by Fbar_rp = 0, whose multipliers enter P as
+Pz_rp = -A_rp / (2 (eps_r - eps_p)), A = X - X^T (pairs degenerate within 1e-6 are dropped, with a warning if
+A_rp is not negligible).  Grid response of the XC terms is omitted (as in pyscf.grad.tduks).
 '''
 
 import types
@@ -297,16 +306,19 @@ def grad_elec(td_grad, spin, state, atmlst=None):
     if atmlst is None:
         atmlst = range(mol.natm)
     occs = _occupations(td)
-    p = _pdiff(td, spin, state)
     auxmol = td._with_df.auxmol
     if auxmol is None:
         # a td-owned DF used only through range_coulomb copies (no full-range term) is never built itself
         auxmol = df.addons.make_auxmol(mol, td._with_df.auxbasis)
     dfterms = _df_terms(mol, auxmol, mo, sfxtda._kernel_terms(*td.xc_coeffs))
-    ghats = _two_body(td, td.xs[spin][state], spin, dfterms)
+    p, ghats = _state_densities(td, spin, state, dfterms)
     fock = _fock_mo(mf, mo)
     vresp = _uks_response(mf, mo, *occs)
     xo = _orbital_lagrangian(fock, vresp, mo, occs, (p / 2, p / 2), dfterms, ghats)
+    if td.damping is not None:
+        pz = _canonical_pz(xo, .5 * (fock[0] + fock[1]).diagonal(), td._orbs, log)
+        p = p + pz
+        xo = xo + _orbital_lagrangian(fock, vresp, mo, occs, (pz / 2, pz / 2), [], [])
     mask, hop, hdiag = _rohf_hessian(fock, vresp, mo, occs)
     z = solve_z(hop, hdiag, -(xo - xo.T)[mask], td_grad.cphf_conv_tol, td_grad.cphf_max_cycle, log)
     zz = _z_densities(z, mask, occs)
@@ -367,8 +379,6 @@ class Gradients(rhf_grad.GradientsBase):
         else:
             self.atmlst = atmlst
         state, spin = self.state, self.spin
-        if td.damping is not None:
-            raise NotImplementedError('SF-XTDA gradients of the damped model')
         if isinstance(mf, dft.rks.KohnShamDFT) and mf.do_nlc():
             raise NotImplementedError('SF-XTDA gradients with NLC')
         if td.xs is None:

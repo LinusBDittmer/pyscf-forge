@@ -89,6 +89,11 @@ def _rohf_g(td, mo, mask):
     xe = 2 * ((mo.T @ f.focka @ mo) * na + (mo.T @ f.fockb @ mo) * nb)
     return (xe - xe.T)[mask]
 
+def _fd_dir(fun, mol, v, h=1e-4):
+    c0 = mol.atom_coords()
+    return (fun(mol.set_geom_(c0 + h * v, unit='Bohr', inplace=False))
+            - fun(mol.set_geom_(c0 - h * v, unit='Bohr', inplace=False))) / (2 * h)
+
 
 class KnownValues(unittest.TestCase):
     def test_df_terms_reproduce_omega(self):
@@ -146,6 +151,50 @@ class KnownValues(unittest.TestCase):
                 zz = sfxtda_grad._z_densities(z, mask, occs)
                 xl = xo + sfxtda_grad._orbital_lagrangian(fock, vresp, mo, occs, zz, [], [])
                 self.assertLess(abs(xl - xl.T).max(), 1e-7)
+
+    def test_fock_skeleton_vs_fd(self):
+        rng = np.random.default_rng(13)
+        for key in ('hf', 'hf_nodf', 'ks', 'cam'):
+            mf = MF[key]
+            nao = mol.nao
+            q = rng.standard_normal((2, nao, nao))
+            q += q.transpose(0, 2, 1)
+            d = np.asarray(mf.make_rdm1())
+            grids = _frozen(mf.grids) if hasattr(mf, 'grids') else None
+            xc = sfxtda._reference(mf)[5]
+
+            def fun(mol2):
+                mf2 = MAKE[key](mol2)
+                if grids is not None:
+                    mf2.grids = grids
+                v = mf2.get_veff(mol2, d)
+                h1 = mf2.get_hcore(mol2)
+                return sum(np.sum(q[t] * (h1 + v[t])) for t in range(2))
+            v = rng.standard_normal((mol.natm, 3))
+            de = sfxtda_grad._fock_skeleton(mf, xc, q, d)
+            # h = 2.5e-5: FD error ~ h^2 (2e-7 at 1e-4); cam keeps ~7e-8 from the pseudo-inverse LR metric (S3)
+            self.assertAlmostEqual(_fd_dir(fun, mol, v, 2.5e-5), np.sum(de * v), delta=1e-7)
+
+    def test_df_skeleton_vs_fd(self):
+        rng = np.random.default_rng(17)
+        for key in ('hf', 'cam'):
+            td = _td(MF[key])
+            mo = td._scf.mo_coeff
+            terms = sfxtda._kernel_terms(*td.xc_coeffs)
+            auxmol = td._with_df.auxmol
+            x = td.xs[0][0]
+            core, somo, virt = td._orbs
+            blocks = sfxtda.csf_list(0, len(core), len(virt))
+
+            def fun(mol2):
+                aux2 = auxmol.set_geom_(mol2.atom_coords(), unit='Bohr', inplace=False)
+                return sum(c * np.sum(_rdm2.contract(x, blocks, dd, core, somo, virt) * t)
+                           for c, _, t, dd in sfxtda_grad._df_terms(mol2, aux2, mo, terms))
+            dfterms = sfxtda_grad._df_terms(mol, auxmol, mo, terms)
+            de = sfxtda_grad._df_skeleton(mol, auxmol, mo, dfterms, sfxtda_grad._two_body(td, x, 0, dfterms))
+            v = rng.standard_normal((mol.natm, 3))
+            # the numerically singular LR metric (pseudo-inverse) puts ~4e-8 of noise on the cam FD
+            self.assertAlmostEqual(_fd_dir(fun, mol, v), np.sum(de * v), delta=1e-8 if key == 'hf' else 1e-7)
 
 
 if __name__ == "__main__":

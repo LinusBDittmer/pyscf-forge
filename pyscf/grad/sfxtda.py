@@ -40,10 +40,12 @@ non-redundant pairs (VC, VO, OC) gives Z_t; Q_t = P/2 + Z_t, W = (X^L + X^L^T)/4
 Only the undamped model is supported; grid response of the XC terms is omitted (as in pyscf.grad.tduks).
 '''
 
+import types
 import numpy
-from pyscf import lib, df
+from pyscf import lib, df, dft
 from pyscf.lib import logger
 from pyscf.df.grad import rhf as df_grad
+from pyscf.grad import tduks as tduks_grad
 from pyscf.sfxtda import sfxtda, _rdm2
 
 
@@ -161,3 +163,65 @@ def _z_densities(z, mask, occs):
     for zt, n in zip(out, occs):
         zt[mask] = 2 * z * (n[None, :] - n[:, None])[mask]
     return .5 * (out + out.transpose(0, 2, 1))
+
+
+def _fock_skeleton(mf, xc_coeffs, q_ao, d_ao, atmlst=None, max_memory=2000):
+    '''d/dA sum_t tr(Q_t F_t[D]) at fixed AO matrices (h, J, K, XC without grid response, DF aux response).'''
+    mol = mf.mol
+    if atmlst is None:
+        atmlst = range(mol.natm)
+    mf_grad = mf.nuc_grad_method()
+    aux = getattr(mf_grad, 'auxbasis_response', False)
+    dms = numpy.vstack([d_ao, q_ao])                      # D_alpha, D_beta, Q_alpha, Q_beta
+    vj = mf_grad.get_j(mol, dms)
+    # (3, nao, nao) bra-derivative matrices; the atom contribution is 2 sum_{mu in A} g . (symmetric density)
+    g = (vj[0] + vj[1]) * (q_ao[0] + q_ao[1]) + (vj[2] + vj[3]) * (d_ao[0] + d_ao[1])
+    de_aux = 0
+    if aux:
+        de_aux = sum(vj.aux[2 + t, s] + vj.aux[s, 2 + t] for s in range(2) for t in range(2))
+    for c, omega in sfxtda._kernel_terms(*xc_coeffs):
+        vk = mf_grad.get_k(mol, dms, omega=(omega or None))
+        g = g - c * sum(vk[t] * q_ao[t] + vk[2 + t] * d_ao[t] for t in range(2))
+        if aux:
+            de_aux = de_aux - c * sum(vk.aux[2 + t, t] + vk.aux[t, 2 + t] for t in range(2))
+    if isinstance(mf, dft.rks.KohnShamDFT):
+        shim = types.SimpleNamespace(mol=mol, base=types.SimpleNamespace(_scf=mf.to_uks()))
+        _, f1oo, v1ao, _ = tduks_grad._contract_xc_kernel(shim, mf.xc, numpy.zeros_like(q_ao), q_ao,
+                                                          with_vxc=True, with_kxc=False, max_memory=max_memory)
+        g = g + sum(v1ao[t, 1:] * q_ao[t] + f1oo[t, 1:] * d_ao[t] for t in range(2))
+    hcore_deriv = mf_grad.hcore_generator(mol)
+    qtot = q_ao[0] + q_ao[1]
+    aoslices = mol.aoslice_by_atom()
+    de = numpy.zeros((len(atmlst), 3))
+    for k, ia in enumerate(atmlst):
+        p0, p1 = aoslices[ia, 2:]
+        de[k] = numpy.einsum('xij,ij->x', hcore_deriv(ia), qtot) + 2 * g[:, p0:p1].sum(axis=(1, 2))
+        if aux:
+            de[k] += de_aux[ia]
+    return de
+
+
+def _df_skeleton(mol, auxmol, mo_coeff, dfterms, ghats, atmlst=None):
+    '''Derivative of the own DF fits: sum_t [Ghat_t . (P|pq)_t^(A) - 1/2 M_t . j2c_t^(A)].'''
+    if atmlst is None:
+        atmlst = range(mol.natm)
+    aoslices = mol.aoslice_by_atom()
+    auxslices = auxmol.aoslice_by_atom()
+    de = numpy.zeros((mol.natm, 3))
+    for (c, omega, t, d), ghat in zip(dfterms, ghats):
+        gao = lib.einsum('Ppq,up,vq->uvP', ghat, mo_coeff, mo_coeff)
+        m = lib.einsum('Ppq,Qpq->PQ', ghat, d)
+        m = .5 * (m + m.T)
+        with mol.with_range_coulomb(omega), auxmol.with_range_coulomb(omega):
+            # ponytail: full (3, nao, nao, naux) derivative integrals, 3 nao^2 naux memory; block over aux
+            # shells with shls_slice if that matters
+            ip1 = df.incore.aux_e2(mol, auxmol, 'int3c2e_ip1', aosym='s1', comp=3)
+            ip2 = df.incore.aux_e2(mol, auxmol, 'int3c2e_ip2', aosym='s1', comp=3)
+            j2c_ip1 = auxmol.intor('int2c2e_ip1', comp=3)
+        for ia in range(mol.natm):
+            p0, p1 = aoslices[ia, 2:]
+            q0, q1 = auxslices[ia, 2:]
+            de[ia] -= 2 * numpy.einsum('xuvP,uvP->x', ip1[:, p0:p1], gao[p0:p1])
+            de[ia] -= numpy.einsum('xuvP,uvP->x', ip2[..., q0:q1], gao[..., q0:q1])
+            de[ia] += numpy.einsum('xPQ,PQ->x', j2c_ip1[:, q0:q1], m[q0:q1])
+    return de[list(atmlst)]

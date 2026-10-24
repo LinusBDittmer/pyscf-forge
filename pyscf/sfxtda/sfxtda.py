@@ -376,6 +376,7 @@ class SFXTDA(lib.StreamObject):
         transition_dm(spin, i, j) : dm[p,q] = <i|a+_q a_p|j> (PySCF fci convention), state density if i == j
         transition_dipole(spin, i) : <i|r|j> for every root j (origin at the nuclear charge centre)
         oscillator_strength(spin, i) : 2/3 (omega_j - omega_i) |<i|r|j>|^2 for every root j
+        nuc_grad_method() : analytic nuclear gradients of one root (pyscf.grad.sfxtda)
     Near-degenerate roots mix within their subspace depending on the Davidson convergence: their
     individual TDMs and f are not well defined, only sums over the near-degenerate set are.
     '''
@@ -448,6 +449,12 @@ class SFXTDA(lib.StreamObject):
         logger.info(self, 'Set %s as a scanner', self.__class__)
         name = self.__class__.__name__ + SFXTDA_Scanner.__name_mixin__
         return lib.set_class(SFXTDA_Scanner(self), (SFXTDA_Scanner, self.__class__), name)
+
+    def nuc_grad_method(self):
+        from pyscf.grad import sfxtda as sfxtda_grad
+        return sfxtda_grad.Gradients(self)
+
+    Gradients = nuc_grad_method
 
     def gen_vind(self, spin):
         '''Sigma-vector function vind(x) for x of shape (m, n) and the exact diagonal hdiag (n,).'''

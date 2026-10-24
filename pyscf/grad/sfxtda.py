@@ -45,6 +45,7 @@ import numpy
 from pyscf import lib, df, dft
 from pyscf.lib import logger
 from pyscf.df.grad import rhf as df_grad
+from pyscf.grad import rhf as rhf_grad
 from pyscf.grad import tduks as tduks_grad
 from pyscf.sfxtda import sfxtda, _rdm2
 
@@ -225,3 +226,119 @@ def _df_skeleton(mol, auxmol, mo_coeff, dfterms, ghats, atmlst=None):
             de[ia] -= numpy.einsum('xuvP,uvP->x', ip2[..., q0:q1], gao[..., q0:q1])
             de[ia] += numpy.einsum('xPQ,PQ->x', j2c_ip1[:, q0:q1], m[q0:q1])
     return de[list(atmlst)]
+
+
+def grad_elec(td_grad, spin, state, atmlst=None):
+    '''omega part of the gradient of root `state` of spin `spin` (Lagrangian assembly; no dE_ROKS/dA).'''
+    log = logger.new_logger(td_grad)
+    td = td_grad.base
+    mf = td._scf
+    mol = td_grad.mol
+    mo = mf.mo_coeff
+    if atmlst is None:
+        atmlst = range(mol.natm)
+    occs = _occupations(td)
+    p = _pdiff(td, spin, state)
+    dfterms = _df_terms(mol, td._with_df.auxmol, mo, sfxtda._kernel_terms(*td.xc_coeffs))
+    ghats = _two_body(td, td.xs[spin][state], spin, dfterms)
+    fock = _fock_mo(mf)
+    vresp = _uks_response(mf, *occs)
+    xo = _orbital_lagrangian(fock, vresp, mo, occs, (p / 2, p / 2), dfterms, ghats)
+    mask, hop, hdiag = _rohf_hessian(fock, vresp, mo, occs)
+    z = solve_z(hop, hdiag, -(xo - xo.T)[mask], td_grad.cphf_conv_tol, td_grad.cphf_max_cycle, log)
+    zz = _z_densities(z, mask, occs)
+    xl = xo + _orbital_lagrangian(fock, vresp, mo, occs, zz, [], [])
+    log.debug('max|X^L - X^L^T| = %.3g', abs(xl - xl.T).max())
+    w_ao = mo @ ((xl + xl.T) / 4) @ mo.T
+    q_ao = lib.einsum('up,tpq,vq->tuv', mo, p / 2 + zz, mo)
+    de = _fock_skeleton(mf, td.xc_coeffs, q_ao, numpy.asarray(mf.make_rdm1()), atmlst, td_grad.max_memory)
+    if dfterms:
+        de += _df_skeleton(mol, td._with_df.auxmol, mo, dfterms, ghats, atmlst)
+    s1 = rhf_grad.get_ovlp(mol)
+    aoslices = mol.aoslice_by_atom()
+    for k, ia in enumerate(atmlst):
+        p0, p1 = aoslices[ia, 2:]
+        de[k] -= 2 * numpy.einsum('xij,ij->x', s1[:, p0:p1], w_ao[p0:p1])
+    return de
+
+
+class Gradients(rhf_grad.GradientsBase):
+    '''Analytic nuclear gradients of one SF-XTDA root (total energy E_ROKS + omega).
+
+    Attributes:
+        state : int
+            0-based root index within the spin block (as in the SFXTDA log and transition_dm).
+        spin : int
+            Total spin S of the root (default: first entry of td.spins).
+        cphf_conv_tol, cphf_max_cycle :
+            Z-vector convergence settings.
+    '''
+    cphf_conv_tol = 1e-8
+    cphf_max_cycle = 50
+    _keys = {'state', 'spin', 'cphf_conv_tol', 'cphf_max_cycle'}
+
+    def __init__(self, td):
+        rhf_grad.GradientsBase.__init__(self, td)
+        self.state = 0
+        self.spin = td.spins[0]
+
+    def dump_flags(self, verbose=None):
+        rhf_grad.GradientsBase.dump_flags(self, verbose)
+        log = logger.new_logger(self, verbose)
+        log.info('S = %d  root %d  cphf_conv_tol = %g  cphf_max_cycle = %d',
+                 self.spin, self.state, self.cphf_conv_tol, self.cphf_max_cycle)
+        return self
+
+    def grad_elec(self, spin=None, state=None, atmlst=None):
+        return grad_elec(self, self.spin if spin is None else spin, self.state if state is None else state, atmlst)
+
+    def kernel(self, state=None, spin=None, atmlst=None):
+        td = self.base
+        mf = td._scf
+        if state is not None:
+            self.state = state
+        if spin is not None:
+            self.spin = spin
+        if atmlst is None:
+            atmlst = self.atmlst
+        else:
+            self.atmlst = atmlst
+        state, spin = self.state, self.spin
+        if td.damping is not None:
+            raise NotImplementedError('SF-XTDA gradients of the damped model')
+        if isinstance(mf, dft.rks.KohnShamDFT) and mf.do_nlc():
+            raise NotImplementedError('SF-XTDA gradients with NLC')
+        if td.xs is None:
+            td.kernel()
+        xs = td._roots(spin)
+        if not 0 <= state < len(xs):
+            raise ValueError(f'state {state} out of range: S={spin} has {len(xs)} roots')
+        if abs(numpy.linalg.norm(xs[state]) - 1) > 1e-6:
+            raise RuntimeError(f'S={spin} root {state} has a non-normalised vector (Davidson subspace collapse)')
+        log = logger.new_logger(self)
+        if not td.converged[spin][state]:
+            log.warn('SF-XTDA S=%d root %d not converged', spin, state)
+        w = td.omega[spin]
+        near = [j for j in (state - 1, state + 1) if 0 <= j < len(w) and abs(w[j] - w[state]) < 1e-4]
+        if near:
+            log.warn('SF-XTDA S=%d root %d near-degenerate with root(s) %s (< 1e-4 Ha): the gradient of a single '
+                     'root is ill-defined', spin, state, near)
+        if self.verbose >= logger.INFO:
+            self.dump_flags()
+        mf_grad = mf.nuc_grad_method()
+        mf_grad.verbose = min(self.verbose, logger.WARN)
+        de = mf_grad.kernel(atmlst=atmlst) + self.grad_elec(spin, state, atmlst)
+        if self.mol.symmetry:
+            de = self.symmetrize(de, atmlst)
+        self.de = de
+        self._finalize()
+        return self.de
+
+    def _finalize(self):
+        if self.verbose >= logger.NOTE:
+            logger.note(self, '--------- SF-XTDA gradients for S=%d root %d ----------', self.spin, self.state)
+            self._write(self.mol, self.de, self.atmlst)
+            logger.note(self, '----------------------------------------------')
+
+
+Grad = Gradients

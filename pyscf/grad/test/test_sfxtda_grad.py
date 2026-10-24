@@ -33,7 +33,8 @@ MAKE = {
 def setUpModule():
     global mol, MF
     mol = gto.M(atom=CH2, basis='6-31g', spin=2, verbose=0)
-    MF = {k: f(mol).run(conv_tol=1e-12) for k, f in MAKE.items()}
+    # omega is not variational in the orbitals: the default conv_tol_grad (1e-6) leaves ~1e-6 FD errors
+    MF = {k: f(mol).run(conv_tol=1e-12, conv_tol_grad=1e-10) for k, f in MAKE.items()}
 
 def tearDownModule():
     global mol, MF
@@ -93,6 +94,39 @@ def _fd_dir(fun, mol, v, h=1e-4):
     c0 = mol.atom_coords()
     return (fun(mol.set_geom_(c0 + h * v, unit='Bohr', inplace=False))
             - fun(mol.set_geom_(c0 - h * v, unit='Bohr', inplace=False))) / (2 * h)
+
+STATES = ((0, 0), (0, 1), (1, 0), (2, 0))
+
+def _scf(key, mol2, grids=None, dm0=None):
+    mf2 = MAKE[key](mol2)
+    if grids is not None:
+        mf2.grids = grids
+    return mf2.run(dm0, conv_tol=1e-12, conv_tol_grad=1e-10)
+
+def _e_states(key, mol2, grids, dm0, states=STATES):
+    td = _td(_scf(key, mol2, grids, dm0))
+    return np.array([td.e_tot[s][k] for s, k in states])
+
+def _check_fd(test, key, states=STATES, tol=1e-6, full=False):
+    mf = MF[key]
+    td = _td(mf)
+    for s, k in states:                           # roots well separated -> FD follows the same root
+        w = td.omega[s]
+        test.assertGreater(min(abs(w[k] - w[j]) for j in range(len(w)) if j != k), 1e-3)
+    grids = _frozen(mf.grids) if hasattr(mf, 'grids') else None
+    dm0 = mf.make_rdm1()
+    fun = lambda m2: _e_states(key, m2, grids, dm0, states)
+    g = td.nuc_grad_method()
+    de = np.array([g.kernel(state=k, spin=s) for s, k in states])
+    if full:
+        for a in range(mol.natm):
+            for c in range(3):
+                v = np.zeros((mol.natm, 3))
+                v[a, c] = 1
+                test.assertLess(abs(_fd_dir(fun, mol, v) - de[:, a, c]).max(), tol)
+    else:
+        v = np.random.default_rng(19).standard_normal((mol.natm, 3))
+        test.assertLess(abs(_fd_dir(fun, mol, v) - np.einsum('nax,ax->n', de, v)).max(), tol)
 
 
 class KnownValues(unittest.TestCase):
@@ -195,6 +229,59 @@ class KnownValues(unittest.TestCase):
             v = rng.standard_normal((mol.natm, 3))
             # the numerically singular LR metric (pseudo-inverse) puts ~4e-8 of noise on the cam FD
             self.assertAlmostEqual(_fd_dir(fun, mol, v), np.sum(de * v), delta=1e-8 if key == 'hf' else 1e-7)
+
+    def test_grad_vs_fd_full(self):
+        _check_fd(self, 'hf', states=((0, 0), (1, 0)), full=True)
+
+    def test_grad_vs_fd_direction(self):
+        for key in ('hf_nodf', 'ks', 'pbe'):
+            _check_fd(self, key)
+
+    def test_grad_vs_fd_rsh_slow(self):
+        _check_fd(self, 'cam', tol=1e-5)
+
+    def test_grad_symmetry(self):
+        atom = "C 0 0 0; H 0 0.95 0.55; H 0 -0.95 0.55"
+        res = []
+        for sym in (True, False):
+            m = gto.M(atom=atom, basis='6-31g', spin=2, symmetry=sym, verbose=0)
+            td = _td(scf.ROHF(m).density_fit().run(conv_tol=1e-12, conv_tol_grad=1e-10))
+            res.append(td.nuc_grad_method().kernel(state=0, spin=1))
+        self.assertAlmostEqual(abs(res[0] - res[1]).max(), 0, 7)
+        self.assertAlmostEqual(abs(res[0][:, 0]).max(), 0, 8)
+
+    def test_grad_hooks_and_errors(self):
+        td = _td(MF['hf'])
+        self.assertIsInstance(td.nuc_grad_method(), sfxtda_grad.Gradients)
+        self.assertIsInstance(td.Gradients(), sfxtda_grad.Gradients)
+        with self.assertRaises(ValueError):
+            td.nuc_grad_method().kernel(state=99, spin=0)
+        td1 = sfxtda.SFXTDA(MF['hf'], spins=(1,))
+        with self.assertRaises(ValueError):
+            td1.nuc_grad_method().kernel(spin=0)
+        tdd = sfxtda.SFXTDA(MF['hf'], damping=(1., 8.))
+        with self.assertRaises(NotImplementedError):
+            tdd.nuc_grad_method().kernel()
+        mfn = dft.ROKS(mol, xc='B3LYP')
+        mfn.nlc = 'vv10'                         # do_nlc() only recognises the lower-case value
+        with self.assertRaises(NotImplementedError):
+            sfxtda.SFXTDA(mfn).nuc_grad_method().kernel()
+
+    def test_grad_refuses_collapsed_root(self):
+        td = _td(MF['hf'])
+        td.xs[1] = td.xs[1].copy()
+        td.xs[1][1] = 1e-8                       # what a collapsed Davidson root looks like (S6)
+        with self.assertRaises(RuntimeError):
+            td.nuc_grad_method().kernel(state=1, spin=1)
+
+    def test_grad_near_degenerate_warning(self):
+        import io
+        td = _td(MF['hf'])
+        g = td.nuc_grad_method()
+        g.stdout = io.StringIO()
+        g.verbose = lib.logger.WARN
+        g.kernel(state=1, spin=1)
+        self.assertIn('near-degenerate', g.stdout.getvalue())
 
 
 if __name__ == "__main__":

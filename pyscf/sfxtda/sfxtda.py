@@ -25,7 +25,9 @@ where [pq|rs] are the integrals over the exact-exchange kernel of the functional
     w(r) = hyb/r + (alpha - hyb) erf(omega r)/r      ((omega, alpha, hyb) as in PySCF),
 i.e. c_H/r for global hybrids, and J, K are built from [pq|rs].  It is evaluated in the SF-XCIS
 space (all M_S = 0 determinants with at most one hole in C and at most one particle in V) in a CSF
-basis.  Every matrix element is taken from the generated formulas in _blocks.py.  All two-electron
+basis.  The orbitals are the reference orbitals rotated to diagonalise Fbar inside C, O and V (one set
+for both spins), independent of the Roothaan matrix of the SCF.  Every matrix element is taken from the
+generated formulas in _blocks.py.  All two-electron
 integrals are density fitted (PySCF's full-range and erf/erfc fits stacked, with a sign per
 auxiliary function) and no N^4 quantity is built: the blocks that touch an OO/CO/OV CSF are stored
 explicitly (at most N^3), the CV-CV block is applied as a sigma vector through one-index operators
@@ -67,10 +69,36 @@ def _reference(mf):
         xc_coeffs = tuple(mf._numint.rsh_and_hybrid_coeff(mf.xc, mol.spin))
     else:
         xc_coeffs = (0., 1., 1.)
-    mo_coeff = mf.mo_coeff
     f = mf.get_fock()
-    fbar = .5 * mo_coeff.T @ (f.focka + f.fockb) @ mo_coeff
+    fsum = f.focka + f.fockb
+    mo_coeff = _canonical_orbitals(mol, mf.mo_coeff, .5 * mf.mo_coeff.T @ fsum @ mf.mo_coeff, core, somo, virt)
+    fbar = .5 * mo_coeff.T @ fsum @ mo_coeff
     return mo_coeff, core, somo, virt, fbar, xc_coeffs
+
+
+def _canonical_orbitals(mol, mo_coeff, fbar, core, somo, virt):
+    '''Orbitals diagonalising Fbar (given in the basis of mo_coeff) inside C, O and V, per irrep with symmetry.
+
+    The spaces are fixed by the ROKS densities, so the result does not depend on the Roothaan matrix of the
+    reference SCF (up to rotations inside degenerate sets).  Each space is sorted by orbital energy and every
+    eigenvector has its largest coefficient positive: already canonical orbitals come back unchanged.
+    '''
+    orbsym = numpy.array(scf.hf_symm.get_orbsym(mol, mo_coeff)) if mol.symmetry else None
+    mo = numpy.array(mo_coeff)
+    for sp in (core, somo, virt):
+        e = numpy.empty(len(sp))
+        u = numpy.zeros((len(sp), len(sp)))
+        for ir in (numpy.unique(orbsym[sp]) if orbsym is not None else [None]):
+            k = numpy.arange(len(sp)) if ir is None else numpy.flatnonzero(orbsym[sp] == ir)
+            ek, uk = numpy.linalg.eigh(fbar[numpy.ix_(sp[k], sp[k])])
+            uk *= numpy.sign(uk[abs(uk).argmax(axis=0), numpy.arange(len(k))])
+            e[k] = ek
+            u[numpy.ix_(k, k)] = uk
+        order = numpy.argsort(e, kind='stable')
+        mo[:, sp] = mo[:, sp] @ u[:, order]
+        if orbsym is not None:
+            orbsym[sp] = orbsym[sp][order]
+    return mo if orbsym is None else lib.tag_array(mo, orbsym=orbsym)
 
 
 def _kernel_terms(omega, alpha, hyb):
@@ -363,6 +391,9 @@ class SFXTDA(lib.StreamObject):
         auxbasis : str
             Auxiliary basis, used only when the reference SCF is not density fitted.
 
+    Saved results:
+        mo_coeff : orbitals of the model, Fbar-canonical inside C, O and V (set by build)
+
     Saved results (dicts keyed by spin):
         omega : excitation energies (Hartree) relative to the reference energy E_ROKS
         e : excitation energies relative to the lowest singlet (equal to omega if S=0 is not
@@ -399,6 +430,7 @@ class SFXTDA(lib.StreamObject):
         self._ints = None
         self._orbs = None
         self._with_df = None
+        self.mo_coeff = None
         self.omega = self.e = self.e_tot = self.irrep = self.converged = self.xs = None
 
     def dump_flags(self, verbose=None):
@@ -426,6 +458,7 @@ class SFXTDA(lib.StreamObject):
         self._with_df = with_df
         self._ints = ints = _DFInts(with_df, mo_coeff, core, somo, virt, fbar, terms)
         self._orbs = (core, somo, virt)
+        self.mo_coeff = mo_coeff
         self.xc_coeffs = xc_coeffs
         mem = sum(b.nbytes for b in (ints.bcc, ints.bcv, ints.bvv, ints.bo)) / 1e6
         log.info('SF-XTDA: nC = %d  nV = %d  naux = %d  omega = %g  alpha = %g  hyb = %g  DF tensors %.1f MB',
@@ -438,7 +471,7 @@ class SFXTDA(lib.StreamObject):
         if mol is not None:
             self.mol = mol
         self._scf.reset(mol)
-        self._ints = self._orbs = self._with_df = None
+        self._ints = self._orbs = self._with_df = self.mo_coeff = None
         self.omega = self.e = self.e_tot = self.irrep = self.converged = self.xs = None
         return self
 
@@ -516,7 +549,7 @@ class SFXTDA(lib.StreamObject):
         if self._orbs is None:
             self.build()
         core, somo, virt = self._orbs
-        orbsym = numpy.asarray(scf.hf_symm.get_orbsym(self.mol, self._scf.mo_coeff)) % 10
+        orbsym = numpy.asarray(scf.hf_symm.get_orbsym(self.mol, self.mo_coeff)) % 10
         return csf_irreps(csf_list(spin, len(core), len(virt)), orbsym, core, somo, virt)
 
     def _forbid(self, x_sym):
@@ -555,7 +588,7 @@ class SFXTDA(lib.StreamObject):
         core, somo, virt = self._orbs
         dm = _tdm.transition_dm(x[i], x[j], csf_list(spin, len(core), len(virt)), core, somo, virt)
         if ao_repr:
-            c = self._scf.mo_coeff
+            c = self.mo_coeff
             dm = c @ dm @ c.T
         return dm
 
@@ -566,7 +599,7 @@ class SFXTDA(lib.StreamObject):
         mol = self.mol
         with mol.with_common_orig(_charge_center(mol)):
             ints = mol.intor_symmetric('int1e_r', comp=3)
-        c = self._scf.mo_coeff
+        c = self.mo_coeff
         ints = lib.einsum('xuv,up,vq->xpq', ints, c, c)
         return numpy.array([numpy.einsum('xpq,qp->x', ints, self.transition_dm(spin, i, j))
                             for j in range(len(x))]).reshape(-1, 3)

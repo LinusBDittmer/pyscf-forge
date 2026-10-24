@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import contextlib
+import copy
 import unittest
 import numpy as np
 from pyscf import gto, scf, dft, lib, symm
@@ -83,7 +84,7 @@ def _dense(td, spin, damping=None):
 
 def _full_b(td):
     '''Signed DF factors (naux, nmo, nmo) of td's kernel terms, stacked as in _DFInts.'''
-    mo = td._scf.mo_coeff
+    mo = td.mo_coeff
     bs, signs = [], []
     for c, o in sfxtda._kernel_terms(*td.xc_coeffs):
         with (contextlib.nullcontext(td._with_df) if o == 0 else td._with_df.range_coulomb(o)) as d:
@@ -92,6 +93,22 @@ def _full_b(td):
                 bs.append(np.sqrt(abs(c)) * lib.einsum('Luv,up,vq->Lpq', b, mo, mo))
                 signs.append(np.full(len(b), np.sign(c)))
     return np.concatenate(bs), np.concatenate(signs)
+
+def _rotated(mf, seed, by_irrep=False):
+    '''Shallow copy of mf with orbitals randomly rotated inside C, O, V (inside each (space, irrep) if by_irrep):
+    the same ROKS state as another Roothaan matrix would deliver it.'''
+    rng = np.random.default_rng(seed)
+    mo = np.array(mf.mo_coeff)
+    lab = mf.mo_occ.astype(int)
+    if by_irrep:
+        orbsym = scf.hf_symm.get_orbsym(mf.mol, mf.mo_coeff)
+        lab = lab * 1000 + orbsym
+    for v in np.unique(lab):
+        idx = np.flatnonzero(lab == v)
+        mo[:, idx] = mo[:, idx] @ np.linalg.qr(rng.standard_normal((idx.size, idx.size)))[0]
+    mf2 = copy.copy(mf)
+    mf2.mo_coeff = lib.tag_array(mo, orbsym=orbsym) if by_irrep else mo
+    return mf2
 
 class KnownValues(unittest.TestCase):
     def test_reference(self):
@@ -111,8 +128,9 @@ class KnownValues(unittest.TestCase):
             sfxtda._reference(scf.ROHF(gto.M(atom=CH2, basis='6-31g', verbose=0)).run())
 
     def test_df_tensors(self):
-        ints = sfxtda.SFXTDA(mf_ks).build()._ints
-        C = mf_ks.mo_coeff
+        td = sfxtda.SFXTDA(mf_ks).build()
+        ints = td._ints
+        C = td.mo_coeff
         cc, cv = C[:, ints.core], C[:, ints.virt]
         co1, co2 = C[:, ints.somo[:1]], C[:, ints.somo[1:]]
         def eri(*cs):
@@ -148,7 +166,7 @@ class KnownValues(unittest.TestCase):
             td = sfxtda.SFXTDA(mf).build()
             self.assertEqual(mol.omega, 0)      # range_coulomb restored
             ints = td._ints
-            C = mf.mo_coeff
+            C = td.mo_coeff
             cc, cv, co = C[:, ints.core], C[:, ints.virt], C[:, ints.somo]
             def w(*cs):
                 '''[pq|rs] from the SCF's own fits via ao2mo.'''
@@ -425,7 +443,7 @@ class KnownValues(unittest.TestCase):
         td.kernel()
         with self.assertRaises(ValueError):
             td.transition_dipole(spin=1)
-        c = mf_ks.mo_coeff
+        c = td.mo_coeff
         dm = td.transition_dm(0, 0, 1)
         self.assertLess(abs(td.transition_dm(0, 0, 1, ao_repr=True) - c @ dm @ c.T).max(), 1e-12)
         self.assertAlmostEqual(np.einsum('pq,qp->', mf_ks.get_ovlp(), td.transition_dm(0, 1, 1, ao_repr=True)),
@@ -513,6 +531,44 @@ class KnownValues(unittest.TestCase):
         yg = _rdm2.contract(x, blocks, g, core, somo, virt)
         self.assertAlmostEqual(abs(yf - yf.transpose(0, 2, 1)).max(), 0, 12)
         self.assertAlmostEqual(np.sum(yf * g), np.sum(f * yg), 10)
+
+    def test_canonical_orbitals_invariance(self):
+        '''Damped energies, AO state densities and oscillator strengths do not depend on rotations of the reference
+        orbitals inside C, O, V; td.mo_coeff is Fbar-canonical and equals PySCF's own orbitals (D5, F2).'''
+        for mf in (mf_hf, mf_ks):
+            tds = []
+            for m in (mf, _rotated(mf, 5)):
+                td = sfxtda.SFXTDA(m, nstates=3, spins=(0, 1, 2), damping=(1., 8.))
+                td.conv_tol = 1e-8
+                td.kernel()
+                tds.append(td)
+            a, b = tds
+            # no permutation or sign flip; the residual rotation follows the SCF convergence (conv_tol 1e-11 here)
+            self.assertLess(abs(a.mo_coeff - mf.mo_coeff).max(), 1e-6)
+            f = mf.get_fock()
+            fbar = .5 * b.mo_coeff.T @ (f.focka + f.fockb) @ b.mo_coeff
+            for sp in a._orbs:
+                blk = fbar[np.ix_(sp, sp)]
+                self.assertLess(abs(blk - np.diag(blk.diagonal())).max(), 1e-10)
+            for spin in (0, 1, 2):
+                self.assertAlmostEqual(abs(a.omega[spin] - b.omega[spin]).max(), 0, 9)
+                self.assertLess(abs(a.transition_dm(spin, 0, 0, ao_repr=True)
+                                    - b.transition_dm(spin, 0, 0, ao_repr=True)).max(), 1e-6)
+                self.assertLess(abs(a.oscillator_strength(spin) - b.oscillator_strength(spin)).max(), 1e-6)
+
+    def test_canonical_orbitals_symmetry(self):
+        '''With mol.symmetry the canonicalisation keeps irreps: same irrep labels and damped energies as unrotated.'''
+        m = gto.M(atom="C 0 0 0; H 0 0.95 0.55; H 0 -0.95 0.55", basis='6-31g', spin=2, symmetry=True, verbose=0)
+        mf = scf.ROHF(m).density_fit().run(conv_tol=1e-11)
+        tds = []
+        for mm in (mf, _rotated(mf, 9, by_irrep=True)):
+            td = sfxtda.SFXTDA(mm, nstates=3, spins=(0, 1), damping=(1., 8.))
+            td.conv_tol = 1e-8
+            td.kernel()
+            tds.append(td)
+        for spin in (0, 1):
+            self.assertEqual(tds[0].irrep[spin], tds[1].irrep[spin])
+            self.assertAlmostEqual(abs(tds[0].omega[spin] - tds[1].omega[spin]).max(), 0, 9)
 
 if __name__ == "__main__":
     print("Full Tests for SF-XTDA")

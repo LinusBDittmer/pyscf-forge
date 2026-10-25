@@ -116,6 +116,35 @@ class KnownValues(unittest.TestCase):
         self.assertLess(abs(d_etf.sum(0)).max(), 1e-10)                        # HF only (F2)
         self.assertEqual(abs(nac.kernel(state=(2, 2))).max(), 0)
 
+    def test_csf_sign_parity(self):
+        '''MO sign flips s change each CSF by the parity of csf_irreps with the flip bits as irreps (F4).'''
+        for spin in (0, 1, 2):
+            td = sfxtda.SFXTDA(MF['ks'], spins=(spin,), damping=(1., 8.)).build()
+            core, somo, virt = td._orbs
+            blocks = sfxtda.csf_list(spin, len(core), len(virt))
+            n = sum(r * c for _, _, (r, c) in blocks)
+            h = td.gen_vind(spin)[0](np.eye(n))
+            s = np.random.default_rng(spin).choice([-1., 1.], td.mo_coeff.shape[1])
+            sig = 1 - 2. * sfxtda.csf_irreps(blocks, (s < 0).astype(int), core, somo, virt)
+            td._ints = sfxtda._DFInts(td._with_df, td.mo_coeff * s, core, somo, virt, td._ints.fbar * np.outer(s, s),
+                                      sfxtda._kernel_terms(*td.xc_coeffs))
+            self.assertLess(abs(td.gen_vind(spin)[0](np.eye(n)) - sig[:, None] * h * sig).max(), 1e-12)
+
+    def test_phase_tracking(self):
+        '''Flipped MO signs (CSF vectors transformed with the parity) and a flipped root give the same NAC (D7).'''
+        td = _td(MF['hf'], 0)
+        nac = td.nac_method()
+        ref = nac.kernel(state=(1, 0), spin=0)
+        core, somo, virt = td._orbs
+        s = np.where(np.arange(td.mo_coeff.shape[1]) % 3 == 0, -1., 1.)
+        sig = 1 - 2. * sfxtda.csf_irreps(sfxtda.csf_list(0, len(core), len(virt)), (s < 0).astype(int),
+                                         core, somo, virt)
+        td.mo_coeff = td.mo_coeff * s              # undamped NAC path reads only mo_coeff and xs
+        td.xs[0] = td.xs[0] * sig
+        td.xs[0][1] *= -1
+        self.assertLess(abs(nac.kernel(state=(1, 0), spin=0) - ref).max(), 1e-8)
+        self.assertLess(abs(nac.reset_phase().kernel(state=(1, 0), spin=0) + ref).max(), 1e-8)
+
 
 if __name__ == "__main__":
     print("Full Tests for SF-XTDA non-adiabatic couplings")

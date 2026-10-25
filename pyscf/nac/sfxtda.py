@@ -38,7 +38,7 @@ the product of the irreps of the two roots and is never symmetrised.  Grid respo
 '''
 
 import numpy
-from pyscf import dft
+from pyscf import gto, dft
 from pyscf.lib import logger
 from pyscf.grad import rhf as rhf_grad
 from pyscf.grad import sfxtda as sfxtda_grad
@@ -88,6 +88,9 @@ class NonAdiabaticCouplings(sfxtda_grad.Gradients):
             invariant, no longer the derivative of the wavefunction overlap.
         cphf_conv_tol, cphf_max_cycle :
             Z-vector convergence settings.
+
+    Root signs are aligned with the previous kernel() call through MO and CSF overlaps (for dynamics; reset_phase()
+    forgets them), so the first call returns the NAC of the roots as computed.
     '''
     _keys = {'mult_ediff', 'use_etfs'}
 
@@ -96,6 +99,7 @@ class NonAdiabaticCouplings(sfxtda_grad.Gradients):
         self.state = (1, 0)
         self.mult_ediff = False
         self.use_etfs = False
+        self._phase_ref = {}
 
     def dump_flags(self, verbose=None):
         rhf_grad.GradientsBase.dump_flags(self, verbose)
@@ -136,7 +140,7 @@ class NonAdiabaticCouplings(sfxtda_grad.Gradients):
             return self.de
         if self.verbose >= logger.INFO:
             self.dump_flags()
-        sign = numpy.ones(len(td.xs[spin]))          # Task 4: self._phases(spin)
+        sign = self._phases(spin)
         h = nac_elec(self, spin, ket, bra, atmlst, self.use_etfs) * (sign[ket] * sign[bra])
         de = td.omega[spin][ket] - td.omega[spin][bra]
         if self.mult_ediff:
@@ -148,6 +152,40 @@ class NonAdiabaticCouplings(sfxtda_grad.Gradients):
             self.de = h / de
         self._finalize()
         return self.de
+
+    def _phases(self, spin):
+        '''Signs (nroots,) that align the roots of spin with the previous kernel() call (all +1 on the first).
+
+        MO signs are aligned with the previous orbitals by sign diag(C0^T S(R0, R) C); a CSF then changes sign with
+        the product of the signs of its singly occupied orbitals, the XOR of csf_irreps with the flip bits as irreps.
+        '''
+        td = self.base
+        core, somo, virt = td._orbs
+        mol, mo, xs = td.mol, td.mo_coeff, td.xs[spin]
+        sign = numpy.ones(len(xs))
+        prev = self._phase_ref.get(spin)
+        if prev is not None:
+            mol0, mo0, x0 = prev
+            s = numpy.where((mo0.T @ gto.intor_cross('int1e_ovlp', mol0, mol) @ mo).diagonal() < 0, -1., 1.)
+            flip = sfxtda.csf_irreps(sfxtda.csf_list(spin, len(core), len(virt)), (s < 0).astype(int),
+                                     core, somo, virt)
+            mo = mo * s
+            xs = xs * (1 - 2. * flip)
+            # ponytail: roots and orbitals matched by index; follow reordering by an overlap assignment if needed
+            n = min(len(x0), len(xs))
+            ov = numpy.einsum('ij,ij->i', x0[:n], xs[:n])
+            sign[:n] = numpy.where(ov < 0, -1., 1.)
+            bad = numpy.flatnonzero(abs(ov) < .5)
+            if bad.size:
+                logger.warn(self, 'SF-XTDA NAC S=%d roots %s: overlap < 0.5 with the previous call (root swap or '
+                            'orbital reordering), their phases are not tracked', spin, bad.tolist())
+        self._phase_ref[spin] = (mol, mo, xs * sign[:, None])
+        return sign
+
+    def reset_phase(self):
+        '''Forget the root phases of earlier calls: the next kernel() takes the roots' signs as they are.'''
+        self._phase_ref = {}
+        return self
 
     def _finalize(self):
         if self.verbose >= logger.NOTE:

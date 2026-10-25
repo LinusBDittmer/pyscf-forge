@@ -208,11 +208,32 @@ class KnownValues(unittest.TestCase):
         self.assertAlmostEqual(_same_up_to_sign(*res), 0, 6)
 
     def test_nac_rotated_reference(self):
-        '''Reference orbitals rotated inside C, O, V give the same NAC, damped and undamped (Derivation, step 6).'''
-        for damping in (None, (1., 8.)):
-            a = _td(MF['ks'], 0, damping).nac_method().kernel(state=(1, 0), spin=0)
-            b = _td(_rotated(MF['ks'], 3), 0, damping).nac_method().kernel(state=(1, 0), spin=0)
-            self.assertAlmostEqual(_same_up_to_sign(a, b), 0, 7)
+        '''Undamped: a non-canonical td.mo_coeff (rotated inside C, O, V after build) gives the same NAC.  Damped: the
+        model is defined in the Fbar-canonical basis, so rotated SCF orbitals give the same NAC.  A constant rotation
+        leaves kappa_intra = 0 consistent in both terms; the R-dependent intra-space choice of Derivation step 6 is
+        tested by test_nac_vs_fd (FD with canonical orbitals at R +- h).'''
+        mf = MF['ks']
+        res = []
+        for rot in (False, True):
+            td = sfxtda.SFXTDA(mf, nstates=4, spins=(0,))
+            td.conv_tol = 1e-10
+            td.build()
+            if rot:
+                core, somo, virt = td._orbs
+                rng = np.random.default_rng(5)
+                u = np.eye(td.mo_coeff.shape[1])
+                for sp in (core, somo, virt):
+                    u[np.ix_(sp, sp)] = np.linalg.qr(rng.standard_normal((sp.size, sp.size)))[0]
+                td.mo_coeff = td.mo_coeff @ u
+                td._ints = sfxtda._DFInts(td._with_df, td.mo_coeff, core, somo, virt, u.T @ td._ints.fbar @ u,
+                                          sfxtda._kernel_terms(*td.xc_coeffs))
+            td.kernel()
+            res.append(td.nac_method().kernel(state=(1, 0), spin=0))
+        self.assertGreater(abs(res[0]).max(), 1e-2)
+        self.assertAlmostEqual(_same_up_to_sign(*res), 0, 7)
+        a = _td(mf, 0, (1., 8.)).nac_method().kernel(state=(1, 0), spin=0)
+        b = _td(_rotated(mf, 3), 0, (1., 8.)).nac_method().kernel(state=(1, 0), spin=0)
+        self.assertAlmostEqual(_same_up_to_sign(a, b), 0, 7)
 
     def test_nac_scanner(self):
         coords2 = mol.atom_coords() + np.array([[0, 0, .03], [0, .02, 0], [.01, 0, -.02]])

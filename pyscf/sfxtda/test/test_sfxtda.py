@@ -547,6 +547,25 @@ class KnownValues(unittest.TestCase):
         self.assertAlmostEqual(abs(yf - yf.transpose(0, 2, 1)).max(), 0, 12)
         self.assertAlmostEqual(np.sum(yf * g), np.sum(f * yg), 10)
 
+    def test_rdm2_contract_bilinear(self):
+        '''contract(x, x2=y) is the polarisation [Y(x+y) - Y(x-y)]/4 of the quadratic contraction.'''
+        td = sfxtda.SFXTDA(mf_ks).build()
+        core, somo, virt = td._orbs
+        rng = np.random.default_rng(11)
+        nmo = len(core) + len(somo) + len(virt)
+        f = rng.standard_normal((3, nmo, nmo))
+        f = f + f.transpose(0, 2, 1)
+        for spin in (0, 1, 2):
+            blocks = sfxtda.csf_list(spin, len(core), len(virt))
+            x, y = rng.standard_normal((2, sum(r * c for _, _, (r, c) in blocks)))
+            ref = (_rdm2.contract(x + y, blocks, f, core, somo, virt)
+                   - _rdm2.contract(x - y, blocks, f, core, somo, virt)) / 4
+            got = _rdm2.contract(x, blocks, f, core, somo, virt, x2=y)
+            self.assertLess(abs(got - ref).max(), 1e-12)
+            self.assertLess(abs(_rdm2.contract(y, blocks, f, core, somo, virt, x2=x) - got).max(), 1e-12)
+            self.assertLess(abs(_rdm2.contract(x, blocks, f, core, somo, virt, x2=x)
+                                - _rdm2.contract(x, blocks, f, core, somo, virt)).max(), 1e-12)
+
     def test_canonical_orbitals_invariance(self):
         '''Damped energies, AO state densities and oscillator strengths do not depend on rotations of the reference
         orbitals inside C, O, V; td.mo_coeff is Fbar-canonical and equals PySCF's own orbitals (D5, F2).'''

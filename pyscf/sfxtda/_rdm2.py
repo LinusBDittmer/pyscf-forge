@@ -38,6 +38,7 @@ bra block u of type A and a ket block v of type B adds, with w = 1 for the same 
 contract_weighted replaces u v by a general symmetric CSF weight W (the damped-model gradient): dense blocks
 between small CSFs and from small to CV CSFs, and a diagonal on each CV-CV block, for which every ket label is
 renamed to the bra label (j -> i, b -> a); w keeps its meaning because W is symmetric.
+contract(x, ..., x2) takes the symmetric weight (x x2^T + x2 x^T)/2 (transition quantities of two roots).
 '''
 
 import itertools
@@ -99,16 +100,23 @@ def _add(y, kind, ops, A, B, terms, f, orb, w):
                     nk, len(orb[labs[r]]), len(orb[labs[s]]))
 
 
-def contract(x, blocks, f, core, somo, virt):
-    '''Y[f] (K, nmo, nmo) of the CSF vector x (blocks = csf_list(spin, nC, nV)) for symmetric f (K, nmo, nmo).'''
+def contract(x, blocks, f, core, somo, virt, x2=None):
+    '''Y[f] (K, nmo, nmo) of the CSF vector x, or of the symmetric weight (x x2^T + x2 x^T)/2 if x2 is given
+    (blocks = csf_list(spin, nC, nV)), for symmetric f (K, nmo, nmo).'''
     orb, shape, off = _layout(blocks, core, somo, virt)
-    us = [x[off[k]:off[k+1]].reshape(shape[cl]) for k, (cl, _, _) in enumerate(blocks)]
+
+    def split(v):
+        return [v[off[k]:off[k+1]].reshape(shape[cl]) for k, (cl, _, _) in enumerate(blocks)]
+    us = split(x)
+    # bra/ket operands and their share of the weight
+    pairs = [(us, us, 1.)] if x2 is None else [(us, split(x2), .5), (split(x2), us, .5)]
     y = numpy.zeros_like(f)
     for p, (A, na, _) in enumerate(blocks):
         for q, (B, nb, _) in enumerate(blocks):
             terms = TWO_BODY.get((A, na, B, nb))
             if terms is not None:
-                _add(y, 'outer', (us[p], us[q]), A, B, terms, f, orb, 1 if p == q else 2)
+                for u, v, s in pairs:
+                    _add(y, 'outer', (u[p], v[q]), A, B, terms, f, orb, s * (1 if p == q else 2))
     return .5 * (y + y.transpose(0, 2, 1))
 
 

@@ -214,6 +214,30 @@ class KnownValues(unittest.TestCase):
             b = _td(_rotated(MF['ks'], 3), 0, damping).nac_method().kernel(state=(1, 0), spin=0)
             self.assertAlmostEqual(_same_up_to_sign(a, b), 0, 7)
 
+    def test_nac_scanner(self):
+        coords2 = mol.atom_coords() + np.array([[0, 0, .03], [0, .02, 0], [.01, 0, -.02]])
+        mol2 = mol.set_geom_(coords2, unit='Bohr', inplace=False)
+
+        def fresh(m):
+            # own SCF: the SCF scanner shares (and rebuilds) with_df with the object it was made from
+            td = sfxtda.SFXTDA(_scf('hf', m), nstates=4, spins=(0,))
+            td.conv_tol = 1e-7
+            return td.run()
+        scanner = fresh(mol).nac_method().as_scanner(state=(1, 0), spin=0)
+        _, d0 = scanner(mol)
+        e2, d2 = scanner(mol2)
+        self.assertTrue(scanner.converged)
+        td2 = fresh(mol2)
+        ref = td2.nac_method().kernel(state=(1, 0), spin=0)
+        self.assertAlmostEqual(abs(e2 - td2.e_tot[0][[1, 0]]).max(), 0, 8)
+        self.assertAlmostEqual(_same_up_to_sign(d2, ref), 0, 5)
+        self.assertGreater(np.sum(d2 * d0), 0)                   # tracked phases: continuous along the path
+        # NAMD loop without a second SF-XTDA run: NAC bound to the gradient scanner's SF-XTDA object
+        g = fresh(mol).nuc_grad_method().as_scanner(state=1, spin=0)
+        nac = g.base.nac_method()
+        g(mol2)
+        self.assertAlmostEqual(_same_up_to_sign(nac.kernel(state=(1, 0), spin=0), ref), 0, 5)
+
 
 if __name__ == "__main__":
     print("Full Tests for SF-XTDA non-adiabatic couplings")

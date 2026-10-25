@@ -38,7 +38,7 @@ the product of the irreps of the two roots and is never symmetrised.  Grid respo
 '''
 
 import numpy
-from pyscf import gto, dft
+from pyscf import lib, gto, dft
 from pyscf.lib import logger
 from pyscf.grad import rhf as rhf_grad
 from pyscf.grad import sfxtda as sfxtda_grad
@@ -90,7 +90,8 @@ class NonAdiabaticCouplings(sfxtda_grad.Gradients):
             Z-vector convergence settings.
 
     Root signs are aligned with the previous kernel() call through MO and CSF overlaps (for dynamics; reset_phase()
-    forgets them), so the first call returns the NAC of the roots as computed.
+    forgets them), so the first call returns the NAC of the roots as computed.  For dynamics, bind the NAC object to
+    a gradient scanner's SF-XTDA object (g.base.nac_method()) to share one SF-XTDA run per geometry.
     '''
     _keys = {'mult_ediff', 'use_etfs'}
 
@@ -194,6 +195,39 @@ class NonAdiabaticCouplings(sfxtda_grad.Gradients):
                         'h = dE * NAC' if self.mult_ediff else 'NAC', self.spin, bra, ket)
             self._write(self.mol, self.de, self.atmlst)
             logger.note(self, '----------------------------------------------')
+
+    def as_scanner(self, state=None, spin=None):
+        '''Scanner: scanner(mol_or_geom) returns (e_tot of (ket, bra), NAC) at the new geometry, root phases tracked
+        between calls.'''
+        if isinstance(self, lib.GradScanner):
+            return self
+        logger.info(self, 'Create scanner for %s', self.__class__)
+        name = self.__class__.__name__ + SFXTDA_NACScanner.__name_mixin__
+        return lib.set_class(SFXTDA_NACScanner(self, state, spin), (SFXTDA_NACScanner, self.__class__), name)
+
+
+class SFXTDA_NACScanner(lib.GradScanner):
+    def __init__(self, nac, state=None, spin=None):
+        lib.GradScanner.__init__(self, nac)
+        if state is not None:
+            self.state = state
+        if spin is not None:
+            self.spin = spin
+
+    def __call__(self, mol_or_geom, state=None, spin=None, **kwargs):
+        if isinstance(mol_or_geom, gto.MoleBase):
+            mol = mol_or_geom
+        else:
+            mol = self.mol.set_geom_(mol_or_geom, inplace=False)
+        self.reset(mol)
+        self.base(mol)
+        nac = self.kernel(state=state, spin=spin, **kwargs)
+        return self.base.e_tot[self.spin][list(self.state)], nac
+
+    @property
+    def converged(self):
+        td = self.base
+        return bool(td._scf.converged and all(td.converged[self.spin][list(self.state)]))
 
 
 NAC = NonAdiabaticCouplings

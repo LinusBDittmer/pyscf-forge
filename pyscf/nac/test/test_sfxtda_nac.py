@@ -90,6 +90,20 @@ def _check_fd(test, key, spin, damping=None, tol=1e-6, pairs=PAIRS, h=1e-4):
         fd = (_overlap(td, tds[0], ket, bra, spin) - _overlap(td, tds[1], ket, bra, spin)) / (2 * h)
         test.assertAlmostEqual(np.sum(d * v), fd, delta=tol)
 
+def _rotated(mf, seed):
+    '''Shallow copy of mf with orbitals randomly rotated inside C, O, V (another Roothaan matrix).'''
+    rng = np.random.default_rng(seed)
+    mo = np.array(mf.mo_coeff)
+    for v in np.unique(mf.mo_occ):
+        idx = np.flatnonzero(mf.mo_occ == v)
+        mo[:, idx] = mo[:, idx] @ np.linalg.qr(rng.standard_normal((idx.size, idx.size)))[0]
+    mf2 = copy.copy(mf)
+    mf2.mo_coeff = mo
+    return mf2
+
+def _same_up_to_sign(a, b):
+    return min(abs(a - b).max(), abs(a + b).max())
+
 class KnownValues(unittest.TestCase):
     def test_nac_vs_fd(self):
         for key in ('hf', 'hf_nodf'):
@@ -144,6 +158,61 @@ class KnownValues(unittest.TestCase):
         td.xs[0][1] *= -1
         self.assertLess(abs(nac.kernel(state=(1, 0), spin=0) - ref).max(), 1e-8)
         self.assertLess(abs(nac.reset_phase().kernel(state=(1, 0), spin=0) + ref).max(), 1e-8)
+
+    def test_nac_hooks_and_errors(self):
+        td = _td(MF['hf'], 0)
+        nac = td.nac_method()
+        self.assertIsInstance(nac, sfxtda_nac.NonAdiabaticCouplings)
+        with self.assertRaises(ValueError):
+            nac.kernel(state=(1, 99), spin=0)
+        with self.assertRaises(ValueError):
+            nac.kernel(state=(0, 1, 2), spin=0)
+        with self.assertRaises(ValueError):
+            nac.kernel(state=(1, 0), spin=2)                     # spin not computed
+        td.xs[0] = td.xs[0].copy()
+        td.xs[0][1] *= .5
+        with self.assertRaises(RuntimeError):
+            nac.kernel(state=(1, 0), spin=0)
+        mfn = dft.ROKS(mol, xc='B3LYP')
+        mfn.nlc = 'vv10'                         # do_nlc() only recognises the lower-case value
+        with self.assertRaises(NotImplementedError):
+            sfxtda_nac.NonAdiabaticCouplings(sfxtda.SFXTDA(mfn)).kernel()
+
+    def test_nac_near_degenerate_warning(self):
+        import io
+        td = sfxtda.SFXTDA(MF['hf'], nstates=4, spins=(1,))
+        td.conv_tol = 1e-9
+        td.kernel()
+        self.assertLess(abs(td.omega[1][2] - td.omega[1][1]), 1e-4)  # 4.9e-5 Ha apart (test_tdm_vs_detci)
+        for mult, warned in ((False, True), (True, False)):
+            buf = io.StringIO()
+            nac = td.nac_method()
+            nac.stdout, nac.verbose = buf, 4
+            nac.kernel(state=(2, 1), spin=1, mult_ediff=mult)
+            self.assertEqual('use mult_ediff' in buf.getvalue(), warned)
+
+    def test_nac_symmetry_irreps(self):
+        '''With mol.symmetry, NACs between roots of different irreps survive and equal the C1 result (D6).'''
+        atom = "C 0 0 0; H 0 0.95 0.55; H 0 -0.95 0.55"
+        res = []
+        for sym in (True, False):
+            m = gto.M(atom=atom, basis='6-31g', spin=2, symmetry=sym, verbose=0)
+            td = sfxtda.SFXTDA(scf.ROHF(m).density_fit().run(conv_tol=1e-12, conv_tol_grad=1e-10),
+                               nstates=4, spins=(0,))
+            td.conv_tol = 1e-8
+            td.kernel()
+            if sym:
+                ket = next(k for k in range(1, 4) if td.irrep[0][k] != td.irrep[0][0])
+            res.append(td.nac_method().kernel(state=(ket, 0), spin=0))
+        self.assertGreater(abs(res[0]).max(), 1e-3)
+        self.assertAlmostEqual(_same_up_to_sign(*res), 0, 6)
+
+    def test_nac_rotated_reference(self):
+        '''Reference orbitals rotated inside C, O, V give the same NAC, damped and undamped (Derivation, step 6).'''
+        for damping in (None, (1., 8.)):
+            a = _td(MF['ks'], 0, damping).nac_method().kernel(state=(1, 0), spin=0)
+            b = _td(_rotated(MF['ks'], 3), 0, damping).nac_method().kernel(state=(1, 0), spin=0)
+            self.assertAlmostEqual(_same_up_to_sign(a, b), 0, 7)
 
 
 if __name__ == "__main__":

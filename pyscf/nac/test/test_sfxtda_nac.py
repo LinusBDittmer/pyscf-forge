@@ -16,7 +16,7 @@
 import copy
 import unittest
 import numpy as np
-from pyscf import gto, scf, dft, lib
+from pyscf import gto, scf, dft
 from pyscf.sfxtda import sfxtda, _tdm
 from pyscf.nac import sfxtda as sfxtda_nac
 
@@ -109,6 +109,9 @@ class KnownValues(unittest.TestCase):
         for key in ('hf', 'hf_nodf'):
             _check_fd(self, key, 0)
 
+    def test_nac_vs_fd_s2(self):
+        _check_fd(self, 'hf', 2)
+
     def test_nac_damped_vs_fd(self):
         for key, damping in (('ks', (1., 8.)), ('hf', (0.9, 5.0)), ('pbe', (1., 8.))):
             _check_fd(self, key, 0, damping, tol=5e-6)
@@ -129,6 +132,8 @@ class KnownValues(unittest.TestCase):
         d_etf = nac.kernel(state=(1, 0), mult_ediff=False, use_etfs=True)
         self.assertLess(abs(d_etf.sum(0)).max(), 1e-10)                        # HF only (F2)
         self.assertEqual(abs(nac.kernel(state=(2, 2))).max(), 0)
+        nac.reset_phase().kernel(state=(2, 2))
+        self.assertIn(0, nac._phase_ref)                                       # phases follow every call
 
     def test_csf_sign_parity(self):
         '''MO sign flips s change each CSF by the parity of csf_irreps with the flip bits as irreps (F4).'''
@@ -159,10 +164,54 @@ class KnownValues(unittest.TestCase):
         self.assertLess(abs(nac.kernel(state=(1, 0), spin=0) - ref).max(), 1e-8)
         self.assertLess(abs(nac.reset_phase().kernel(state=(1, 0), spin=0) + ref).max(), 1e-8)
 
+    def test_phase_warning_only_for_the_pair(self):
+        '''A weak overlap with the previous call warns only for ket and bra, and says the phase is uncertain.'''
+        import io
+        td = _td(MF['hf'], 0)
+        nac = td.nac_method()
+        nac.kernel(state=(1, 0), spin=0)
+        self.assertIsNot(nac._phase_ref[0][0], td.mol)          # moving td.mol in place keeps the reference
+        for root, warned in ((3, False), (1, True)):
+            mol0, mo0, x0 = nac._phase_ref[0]
+            x0 = x0.copy()
+            x0[root] = 0                                         # no overlap with the stored reference
+            nac._phase_ref[0] = (mol0, mo0, x0)
+            buf = io.StringIO()
+            nac.stdout, nac.verbose = buf, 4
+            nac.kernel(state=(1, 0), spin=0)
+            self.assertEqual('weak overlap' in buf.getvalue(), warned)
+
+    def test_phase_tracking_across_geometries(self):
+        '''Phases tracked to a new geometry survive MO sign flips and a flipped root there (D7).'''
+        td = _td(MF['hf'], 0)
+        nac = td.nac_method()
+        nac.kernel(state=(1, 0), spin=0)
+        saved = nac._phase_ref[0]
+        mol2 = mol.set_geom_(mol.atom_coords() + np.array([[0, 0, .03], [0, .02, 0], [.01, 0, -.02]]),
+                             unit='Bohr', inplace=False)
+        td2 = _td(_scf('hf', mol2), 0)
+        nac2 = td2.nac_method()
+        nac2._phase_ref = {0: saved}
+        ref = nac2.kernel(state=(1, 0), spin=0)
+        core, somo, virt = td2._orbs
+        s = np.where(np.arange(td2.mo_coeff.shape[1]) % 3 == 1, -1., 1.)
+        sig = 1 - 2. * sfxtda.csf_irreps(sfxtda.csf_list(0, len(core), len(virt)), (s < 0).astype(int),
+                                         core, somo, virt)
+        td2.mo_coeff = td2.mo_coeff * s              # undamped NAC path reads only mo_coeff and xs
+        td2.xs[0] = td2.xs[0] * sig
+        td2.xs[0][1] *= -1
+        nac3 = td2.nac_method()
+        nac3._phase_ref = {0: saved}
+        self.assertLess(abs(nac3.kernel(state=(1, 0), spin=0) - ref).max(), 1e-8)
+
     def test_nac_hooks_and_errors(self):
         td = _td(MF['hf'], 0)
         nac = td.nac_method()
         self.assertIsInstance(nac, sfxtda_nac.NonAdiabaticCouplings)
+        for bad in (1, (0, 1, 2)):
+            with self.assertRaises(ValueError):
+                nac.kernel(state=bad, spin=0)
+        self.assertEqual(nac.state, (1, 0))                     # a rejected state is not kept
         with self.assertRaises(ValueError):
             nac.kernel(state=(1, 99), spin=0)
         with self.assertRaises(ValueError):
@@ -244,7 +293,8 @@ class KnownValues(unittest.TestCase):
             td = sfxtda.SFXTDA(_scf('hf', m), nstates=4, spins=(0,))
             td.conv_tol = 1e-7
             return td.run()
-        scanner = fresh(mol).nac_method().as_scanner(state=(1, 0), spin=0)
+        nac0 = fresh(mol).nac_method()
+        scanner = nac0.as_scanner(state=(1, 0), spin=0)
         _, d0 = scanner(mol)
         e2, d2 = scanner(mol2)
         self.assertTrue(scanner.converged)
@@ -253,11 +303,18 @@ class KnownValues(unittest.TestCase):
         self.assertAlmostEqual(abs(e2 - td2.e_tot[0][[1, 0]]).max(), 0, 8)
         self.assertAlmostEqual(_same_up_to_sign(d2, ref), 0, 5)
         self.assertGreater(np.sum(d2 * d0), 0)                   # tracked phases: continuous along the path
+        self.assertEqual(nac0._phase_ref, {})                    # the scanner tracks its own phases
         # NAMD loop without a second SF-XTDA run: NAC bound to the gradient scanner's SF-XTDA object
         g = fresh(mol).nuc_grad_method().as_scanner(state=1, spin=0)
         nac = g.base.nac_method()
         g(mol2)
         self.assertAlmostEqual(_same_up_to_sign(nac.kernel(state=(1, 0), spin=0), ref), 0, 5)
+        g(mol)
+        stale = g.base.nac_method()                              # bound at mol, then moved without kernel()
+        g(mol2)
+        w = g.base.omega[0]
+        h = sfxtda_nac.nac_elec(stale, 0, 1, 0)
+        self.assertAlmostEqual(_same_up_to_sign(h, (w[1] - w[0]) * ref), 0, 5)
 
 
 if __name__ == "__main__":

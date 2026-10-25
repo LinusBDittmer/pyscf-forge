@@ -179,9 +179,9 @@ def _canonical_pz(xo, eps, spaces, log, thresh=1e-6):
         blk[ok] = -asp[ok] / (2 * de[ok])
         pz[numpy.ix_(sp, sp)] = blk
         for r, q in zip(*numpy.nonzero(numpy.triu(deg & (abs(asp) > 1e-6)))):
-            log.warn('SF-XTDA damped gradient: canonical orbitals %d and %d are degenerate (|de| < %g) but carry a '
-                     'Lagrangian asymmetry of %.2g; the damped energy depends on their arbitrary rotation, the '
-                     'gradient is approximate', sp[r], sp[q], thresh, asp[r, q])
+            log.warn('SF-XTDA damped model: canonical orbitals %d and %d are degenerate (|de| < %g) but carry a '
+                     'Lagrangian asymmetry of %.2g; the damped roots depend on their arbitrary rotation, the '
+                     'derivative is approximate', sp[r], sp[q], thresh, asp[r, q])
     return pz
 
 
@@ -334,8 +334,9 @@ def _relaxed(td_grad, p, ghats, auxmol, dfterms, xa=0, atmlst=None):
     z = solve_z(hop, hdiag, -(xo - xo.T)[mask], td_grad.cphf_conv_tol, td_grad.cphf_max_cycle, log)
     zz = _z_densities(z, mask, occs)
     xl = xo + _orbital_lagrangian(fock, vresp, mo, occs, zz, [], [])
-    # intra-space asymmetry is expected for transition quantities (kappa_intra = 0)
-    log.debug('max|X^L - X^L^T| on non-redundant pairs = %.3g', abs((xl - xl.T)[mask]).max())
+    # non-redundant pairs: Z-vector residual; intra-space: a check for gradients, expected for transition quantities
+    asym = abs(xl - xl.T)
+    log.debug('max|X^L - X^L^T| = %.3g on non-redundant pairs, %.3g in all', asym[mask].max(), asym.max())
     w_ao = mo @ ((xl + xl.T) / 4) @ mo.T
     q_ao = lib.einsum('up,tpq,vq->tuv', mo, p / 2 + zz, mo)
     de = _fock_skeleton(mf, td.xc_coeffs, q_ao, numpy.asarray(mf.make_rdm1()), atmlst, td_grad.max_memory)

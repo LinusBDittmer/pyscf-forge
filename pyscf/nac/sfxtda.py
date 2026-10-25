@@ -48,7 +48,9 @@ from pyscf.sfxtda import sfxtda, _tdm
 def nac_elec(nac, spin, ket, bra, atmlst=None, use_etfs=False):
     '''h = (omega_ket - omega_bra) <bra|d ket/dR>, shape (len(atmlst), 3); symmetric in ket and bra.'''
     td = nac.base
-    mol, mo = nac.mol, td.mo_coeff
+    # follow the SF-XTDA object (the relaxation reads nac.mol): a scanner may have moved it since nac was bound
+    nac.mol = td.mol
+    mol, mo = td.mol, td.mo_coeff
     if atmlst is None:
         atmlst = range(mol.natm)
     core, somo, virt = td._orbs
@@ -115,7 +117,9 @@ class NonAdiabaticCouplings(sfxtda_grad.Gradients):
         # follow the SF-XTDA object: a gradient scanner sharing it moves td.mol without touching this object
         self.mol = td.mol
         if state is not None:
-            self.state = state
+            if numpy.ndim(state) != 1 or len(state) != 2:
+                raise ValueError(f'state must be a pair (ket, bra), got {state}')
+            self.state = tuple(state)
         if spin is not None:
             self.spin = spin
         if mult_ediff is not None:
@@ -126,8 +130,6 @@ class NonAdiabaticCouplings(sfxtda_grad.Gradients):
             atmlst = self.atmlst
         else:
             self.atmlst = atmlst
-        if len(self.state) != 2:
-            raise ValueError(f'state must be a pair (ket, bra), got {self.state}')
         (ket, bra), spin = self.state, self.spin
         if isinstance(mf, dft.rks.KohnShamDFT) and mf.do_nlc():
             raise NotImplementedError('SF-XTDA NACs with NLC')
@@ -136,12 +138,12 @@ class NonAdiabaticCouplings(sfxtda_grad.Gradients):
         log = logger.new_logger(self)
         for k in (ket, bra):
             sfxtda_grad._check_root(td, spin, k, log)
+        sign = self._phases(spin)
         if ket == bra:
             self.de = numpy.zeros((self.mol.natm if atmlst is None else len(atmlst), 3))
             return self.de
         if self.verbose >= logger.INFO:
             self.dump_flags()
-        sign = self._phases(spin)
         h = nac_elec(self, spin, ket, bra, atmlst, self.use_etfs) * (sign[ket] * sign[bra])
         de = td.omega[spin][ket] - td.omega[spin][bra]
         if self.mult_ediff:
@@ -176,11 +178,12 @@ class NonAdiabaticCouplings(sfxtda_grad.Gradients):
             n = min(len(x0), len(xs))
             ov = numpy.einsum('ij,ij->i', x0[:n], xs[:n])
             sign[:n] = numpy.where(ov < 0, -1., 1.)
-            bad = numpy.flatnonzero(abs(ov) < .5)
-            if bad.size:
-                logger.warn(self, 'SF-XTDA NAC S=%d roots %s: overlap < 0.5 with the previous call (root swap or '
-                            'orbital reordering), their phases are not tracked', spin, bad.tolist())
-        self._phase_ref[spin] = (mol, mo, xs * sign[:, None])
+            bad = [k for k in sorted(set(self.state)) if k < n and abs(ov[k]) < .5]
+            if bad:
+                logger.warn(self, 'SF-XTDA NAC S=%d roots %s: weak overlap (< 0.5) with the previous call (root swap '
+                            'or orbital reordering), their phases may be wrong', spin, bad)
+        # a copy: moving the caller's Mole in place must not move the reference geometry
+        self._phase_ref[spin] = (mol.copy(), mo, xs * sign[:, None])
         return sign
 
     def reset_phase(self):
@@ -209,6 +212,7 @@ class NonAdiabaticCouplings(sfxtda_grad.Gradients):
 class SFXTDA_NACScanner(lib.GradScanner):
     def __init__(self, nac, state=None, spin=None):
         lib.GradScanner.__init__(self, nac)
+        self._phase_ref = {}                    # own phases, not shared with the object it was made from
         if state is not None:
             self.state = state
         if spin is not None:

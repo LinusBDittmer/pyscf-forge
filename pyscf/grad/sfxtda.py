@@ -47,6 +47,9 @@ contracted into P and Ghat_t by _tdm.weighted_dm and _rdm2.contract_weighted.  T
 rotations inside C, O and V; td.mo_coeff fixes them by Fbar_rp = 0, whose multipliers enter P as
 Pz_rp = -A_rp / (2 (eps_r - eps_p)), A = X - X^T (pairs degenerate within 1e-6 are dropped, with a warning if
 A_rp is not negligible).  Grid response of the XC terms is omitted (as in pyscf.grad.tduks).
+
+The densities are bilinear in two roots (state2), and _relaxed takes an extra antisymmetric Lagrangian term:
+pyscf.nac.sfxtda reuses both.
 '''
 
 import types
@@ -77,13 +80,6 @@ def _uks_response(mf, mo, na, nb):
     return mf.gen_response(mo_coeff=(mo, mo), mo_occ=(na, nb), hermi=1)
 
 
-def _pdiff(td, spin, state):
-    core, somo, _ = td._orbs
-    g0 = numpy.zeros(td._scf.mo_coeff.shape[1])
-    g0[core], g0[somo] = 2, 1
-    return td.transition_dm(spin, state, state) - numpy.diag(g0)
-
-
 def _df_terms(mol, auxmol, mo_coeff, terms):
     '''Own DF fit per kernel term: [(c, omega, T (naux, nmo, nmo), d = j2c^-1 T)].'''
     out = []
@@ -100,41 +96,52 @@ def _df_terms(mol, auxmol, mo_coeff, terms):
     return out
 
 
-def _two_body(td, x, spin, dfterms):
+def _two_body(td, x, spin, dfterms, x2=None):
     core, somo, virt = td._orbs
     blocks = sfxtda.csf_list(spin, len(core), len(virt))
-    return [2 * c * _rdm2.contract(x, blocks, d, core, somo, virt) for c, _, _, d in dfterms]
+    return [2 * c * _rdm2.contract(x, blocks, d, core, somo, virt, x2) for c, _, _, d in dfterms]
 
 
-def _damping_weights(x, hss, hsl, d_small, d_large, p1, p2):
-    '''dW of the damped Rayleigh quotient (undamped hss, hsl): d omega = sum (x x^T + dW) dH.
+def _damping_weights(x, hss, hsl, d_small, d_large, p1, p2, x2=None):
+    '''dW of the damped bilinear form x.Htilde.x2 (undamped hss, hsl): d(x.Htilde.x2) = sum (S + dW) dH with the
+    symmetric S = (x x2^T + x2 x^T)/2 (x2 = None: x2 = x, the damped Rayleigh quotient).
 
     Returns (wss, wsl, gs, gl) with dW_ss = wss + diag(gs), dW_sl = wsl, dW_ll = diag(gl).
     '''
     ns = hss.shape[0]
-    xs, xl = x[:ns], x[ns:]
+    if x2 is None:
+        x2 = x
     fss, fsl = sfxtda.damping_factors(d_small, d_large, p1, p2)
-    # ponytail: about four (ns, nl) arrays live at once, the size of hsl; block over large columns if memory matters
-    a_ss = numpy.outer(xs, xs) * hss * fss * (-4 * p2 * (d_small[:, None] - d_small[None, :])**3)
-    a_sl = numpy.outer(xs, xl) * hsl * fsl * (-4 * p2 * (d_small[:, None] - d_large[None, :])**3)
+    # ponytail: about five (ns, nl) arrays live at once, the size of hsl; block over large columns if memory matters
+    oss = .5 * (numpy.outer(x[:ns], x2[:ns]) + numpy.outer(x2[:ns], x[:ns]))
+    osl = .5 * (numpy.outer(x[:ns], x2[ns:]) + numpy.outer(x2[:ns], x[ns:]))
+    a_ss = oss * hss * fss * (-4 * p2 * (d_small[:, None] - d_small[None, :])**3)
+    a_sl = osl * hsl * fsl * (-4 * p2 * (d_small[:, None] - d_large[None, :])**3)
     gs = 2 * (a_ss.sum(1) + a_sl.sum(1))
     gl = -2 * a_sl.sum(0)
-    return numpy.outer(xs, xs) * (fss - 1), numpy.outer(xs, xl) * (fsl - 1), gs, gl
+    return oss * (fss - 1), osl * (fsl - 1), gs, gl
 
 
-def _state_densities(td, spin, state, dfterms):
-    '''P (MO) and Ghat_t of root `state`: x x^T, plus the damping weight dW if td.damping is set.'''
+def _state_densities(td, spin, state, dfterms, state2=None):
+    '''P (MO) and Ghat_t of the symmetric weight S = (x x2^T + x2 x^T)/2 of roots state and state2 (default: state),
+    plus the damping weight dW if td.damping is set.  P = sym(gamma^{x x2}) - (x.x2) gamma0: the state density
+    difference for one root, the symmetric transition density for two.'''
     x = td.xs[spin][state]
-    p = _pdiff(td, spin, state)
-    ghats = _two_body(td, x, spin, dfterms)
+    x2 = None if state2 is None else td.xs[spin][state2]
+    core, somo, virt = td._orbs
+    blocks = sfxtda.csf_list(spin, len(core), len(virt))
+    y = x if x2 is None else x2
+    dm = _tdm.transition_dm(x, y, blocks, core, somo, virt)
+    g0 = numpy.zeros(len(dm))
+    g0[core], g0[somo] = 2, 1
+    p = .5 * (dm + dm.T) - (x @ y) * numpy.diag(g0)
+    ghats = _two_body(td, x, spin, dfterms, x2)
     if td.damping is None:
         return p, ghats
     ints = td._ints
-    core, somo, virt = td._orbs
-    blocks = sfxtda.csf_list(spin, len(core), len(virt))
     hss, hsl = sfxtda.build_small(ints, spin)
     hdl = sfxtda.hdiag_large(ints, *sfxtda.cvcv_operator(ints, spin))
-    wss, wsl, gs, gl = _damping_weights(x, hss, hsl, hss.diagonal().copy(), hdl.ravel(), *td.damping)
+    wss, wsl, gs, gl = _damping_weights(x, hss, hsl, hss.diagonal().copy(), hdl.ravel(), *td.damping, x2=x2)
     wss = wss + numpy.diag(gs)
     p = p + _tdm.weighted_dm(wss, wsl, gl, blocks, core, somo, virt)
     ghats = [g + 2 * c * _rdm2.contract_weighted(wss, wsl, gl, blocks, d, core, somo, virt)
@@ -296,8 +303,18 @@ def _df_skeleton(mol, auxmol, mo_coeff, dfterms, ghats, atmlst=None):
     return de[list(atmlst)]
 
 
-def grad_elec(td_grad, spin, state, atmlst=None):
-    '''omega part of the gradient of root `state` of spin `spin` (Lagrangian assembly; no dE_ROKS/dA).'''
+def _auxmol(td):
+    auxmol = td._with_df.auxmol
+    if auxmol is None:
+        # a td-owned DF used only through range_coulomb copies (no full-range term) is never built itself
+        auxmol = df.addons.make_auxmol(td.mol, td._with_df.auxbasis)
+    return auxmol
+
+
+def _relaxed(td_grad, p, ghats, auxmol, dfterms, xa=0, atmlst=None):
+    '''Orbital-relaxed derivative of tr(P Fbar) + sum Gamma [pq|rs] (P, Ghat_t of _state_densities) plus sum xa.U
+    (C -> C(1 + U)) for an antisymmetric MO matrix xa; no dE_ROKS/dA.  The canonical constraint is added if
+    td.damping is set (its multipliers see xa).'''
     log = logger.new_logger(td_grad)
     td = td_grad.base
     mf = td._scf
@@ -306,15 +323,9 @@ def grad_elec(td_grad, spin, state, atmlst=None):
     if atmlst is None:
         atmlst = range(mol.natm)
     occs = _occupations(td)
-    auxmol = td._with_df.auxmol
-    if auxmol is None:
-        # a td-owned DF used only through range_coulomb copies (no full-range term) is never built itself
-        auxmol = df.addons.make_auxmol(mol, td._with_df.auxbasis)
-    dfterms = _df_terms(mol, auxmol, mo, sfxtda._kernel_terms(*td.xc_coeffs))
-    p, ghats = _state_densities(td, spin, state, dfterms)
     fock = _fock_mo(mf, mo)
     vresp = _uks_response(mf, mo, *occs)
-    xo = _orbital_lagrangian(fock, vresp, mo, occs, (p / 2, p / 2), dfterms, ghats)
+    xo = _orbital_lagrangian(fock, vresp, mo, occs, (p / 2, p / 2), dfterms, ghats) + xa
     if td.damping is not None:
         pz = _canonical_pz(xo, .5 * (fock[0] + fock[1]).diagonal(), td._orbs, log)
         p = p + pz
@@ -323,7 +334,8 @@ def grad_elec(td_grad, spin, state, atmlst=None):
     z = solve_z(hop, hdiag, -(xo - xo.T)[mask], td_grad.cphf_conv_tol, td_grad.cphf_max_cycle, log)
     zz = _z_densities(z, mask, occs)
     xl = xo + _orbital_lagrangian(fock, vresp, mo, occs, zz, [], [])
-    log.debug('max|X^L - X^L^T| = %.3g', abs(xl - xl.T).max())
+    # intra-space asymmetry is expected for transition quantities (kappa_intra = 0)
+    log.debug('max|X^L - X^L^T| on non-redundant pairs = %.3g', abs((xl - xl.T)[mask]).max())
     w_ao = mo @ ((xl + xl.T) / 4) @ mo.T
     q_ao = lib.einsum('up,tpq,vq->tuv', mo, p / 2 + zz, mo)
     de = _fock_skeleton(mf, td.xc_coeffs, q_ao, numpy.asarray(mf.make_rdm1()), atmlst, td_grad.max_memory)
@@ -335,6 +347,26 @@ def grad_elec(td_grad, spin, state, atmlst=None):
         p0, p1 = aoslices[ia, 2:]
         de[k] -= 2 * numpy.einsum('xij,ij->x', s1[:, p0:p1], w_ao[p0:p1])
     return de
+
+
+def grad_elec(td_grad, spin, state, atmlst=None):
+    '''omega part of the gradient of root `state` of spin `spin` (Lagrangian assembly; no dE_ROKS/dA).'''
+    td = td_grad.base
+    auxmol = _auxmol(td)
+    dfterms = _df_terms(td_grad.mol, auxmol, td.mo_coeff, sfxtda._kernel_terms(*td.xc_coeffs))
+    p, ghats = _state_densities(td, spin, state, dfterms)
+    return _relaxed(td_grad, p, ghats, auxmol, dfterms, atmlst=atmlst)
+
+
+def _check_root(td, spin, state, log):
+    '''Refuse a missing or collapsed root, warn on an unconverged one.'''
+    xs = td._roots(spin)
+    if not 0 <= state < len(xs):
+        raise ValueError(f'state {state} out of range: S={spin} has {len(xs)} roots')
+    if abs(numpy.linalg.norm(xs[state]) - 1) > 1e-6:
+        raise RuntimeError(f'S={spin} root {state} has a non-normalised vector (Davidson subspace collapse)')
+    if not td.converged[spin][state]:
+        log.warn('SF-XTDA S=%d root %d not converged', spin, state)
 
 
 class Gradients(rhf_grad.GradientsBase):
@@ -383,14 +415,8 @@ class Gradients(rhf_grad.GradientsBase):
             raise NotImplementedError('SF-XTDA gradients with NLC')
         if td.xs is None:
             td.kernel()
-        xs = td._roots(spin)
-        if not 0 <= state < len(xs):
-            raise ValueError(f'state {state} out of range: S={spin} has {len(xs)} roots')
-        if abs(numpy.linalg.norm(xs[state]) - 1) > 1e-6:
-            raise RuntimeError(f'S={spin} root {state} has a non-normalised vector (Davidson subspace collapse)')
         log = logger.new_logger(self)
-        if not td.converged[spin][state]:
-            log.warn('SF-XTDA S=%d root %d not converged', spin, state)
+        _check_root(td, spin, state, log)
         w = td.omega[spin]
         near = [j for j in (state - 1, state + 1) if 0 <= j < len(w) and abs(w[j] - w[state]) < 1e-4]
         if near:

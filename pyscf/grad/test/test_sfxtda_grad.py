@@ -206,6 +206,36 @@ class KnownValues(unittest.TestCase):
         self.assertAlmostEqual(fd, np.sum(w * v), delta=1e-8)
         self.assertAlmostEqual(gs.sum() + gl.sum(), 0, 12)
 
+    def test_damping_weights_bilinear(self):
+        '''_damping_weights(x, .., x2=y) is the polarisation of the quadratic weights (D2).'''
+        rng = np.random.default_rng(4)
+        ns, nl = 5, 9
+        h = rng.standard_normal((ns + nl, ns + nl))
+        h = h + h.T
+        x, y = rng.standard_normal((2, ns + nl))
+        args = (h[:ns, :ns], h[:ns, ns:], h.diagonal()[:ns], h.diagonal()[ns:], .9, 8.)
+        got = sfxtda_grad._damping_weights(x, *args, x2=y)
+        plus = sfxtda_grad._damping_weights(x + y, *args)
+        minus = sfxtda_grad._damping_weights(x - y, *args)
+        for g, a, b in zip(got, plus, minus):
+            self.assertLess(abs(g - (a - b) / 4).max(), 1e-12)
+
+    def test_state_densities_bilinear(self):
+        '''Transition P, Ghat are symmetric in the two roots; state2 = state reproduces the state densities.'''
+        for key, damping in (('cam', None), ('ks', (1., 8.))):
+            td = _td(MF[key], damping=damping)
+            dfterms = sfxtda_grad._df_terms(td.mol, sfxtda_grad._auxmol(td), td.mo_coeff,
+                                            sfxtda._kernel_terms(*td.xc_coeffs))
+            p01, g01 = sfxtda_grad._state_densities(td, 0, 0, dfterms, 1)
+            p10, g10 = sfxtda_grad._state_densities(td, 0, 1, dfterms, 0)
+            p00, g00 = sfxtda_grad._state_densities(td, 0, 0, dfterms)
+            p00b, g00b = sfxtda_grad._state_densities(td, 0, 0, dfterms, 0)
+            self.assertLess(abs(p01 - p10).max(), 1e-12)
+            self.assertLess(abs(p00 - p00b).max(), 1e-10)
+            self.assertLess(abs(np.trace(p01)), 1e-8)                  # traceless transition density
+            for a, b in list(zip(g01, g10)) + list(zip(g00, g00b)):
+                self.assertLess(abs(a - b).max(), 1e-10)
+
     def test_orbital_lagrangian_damped_vs_fd(self):
         '''X^omega of the damped model vs FD of x.Htilde(U).x (x fixed); intra-space rotations now contribute.'''
         rng = np.random.default_rng(11)

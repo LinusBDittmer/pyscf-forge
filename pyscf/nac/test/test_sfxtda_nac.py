@@ -1,0 +1,122 @@
+#!/usr/bin/env python
+# Copyright 2014-2026 The PySCF Developers. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import copy
+import unittest
+import numpy as np
+from pyscf import gto, scf, dft, lib
+from pyscf.sfxtda import sfxtda, _tdm
+from pyscf.nac import sfxtda as sfxtda_nac
+
+CH2 = "C 0 0 0; H 0.1 1.0 0.5; H -0.2 -0.95 0.35"
+MAKE = {
+    'hf': lambda m: scf.ROHF(m).density_fit(),
+    'hf_nodf': lambda m: scf.ROHF(m),
+    'ks': lambda m: dft.ROKS(m, xc='BHANDHLYP').density_fit(),
+    'pbe': lambda m: dft.ROKS(m, xc='PBE').density_fit(),
+    'cam': lambda m: dft.ROKS(m, xc='CAM-B3LYP').density_fit(),
+}
+PAIRS = ((1, 0), (2, 0), (3, 1))           # (ket, bra)
+
+def setUpModule():
+    global mol, MF
+    mol = gto.M(atom=CH2, basis='6-31g', spin=2, verbose=0)
+    MF = {k: f(mol).run(conv_tol=1e-12, conv_tol_grad=1e-10) for k, f in MAKE.items()}
+
+def tearDownModule():
+    global mol, MF
+    del mol, MF
+
+def _scf(key, mol2, grids=None, dm0=None):
+    mf2 = MAKE[key](mol2)
+    if grids is not None:
+        mf2.grids = grids
+    return mf2.run(dm0, conv_tol=1e-12, conv_tol_grad=1e-10)
+
+def _frozen(grids):
+    '''Grid of the reference geometry without AO screening: FD derivatives then exclude grid response.'''
+    g = copy.copy(grids)
+    g.non0tab = g.screen_index = None
+    return g
+
+def _td(mf, spin, damping=None, nstates=5):
+    '''Roots of one spin with exact eigenvectors (dense vind(1), n ~ 140), signs as from Davidson (D9, F3).'''
+    td = sfxtda.SFXTDA(mf, nstates=nstates, spins=(spin,), damping=damping)
+    td.kernel()
+    vind, _ = td.gen_vind(spin)
+    w, v = np.linalg.eigh(vind(np.eye(td.xs[spin].shape[1])))
+    v = v[:, :nstates].T
+    td.xs[spin] = v * np.sign(np.einsum('ij,ij->i', v, td.xs[spin]))[:, None]
+    td.omega[spin] = w[:nstates]
+    return td
+
+def _overlap(td0, td1, ket, bra, spin):
+    '''<bra(R0)|ket(R1)> to first order in eps = C0^T S01 C1 - 1 (error even in the step), ket(R1) sign-aligned.'''
+    core, somo, virt = td0._orbs
+    blocks = sfxtda.csf_list(spin, len(core), len(virt))
+    eps = td0.mo_coeff.T @ gto.intor_cross('int1e_ovlp', td0.mol, td1.mol) @ td1.mo_coeff
+    eps -= np.eye(len(eps))
+    xb = td0.xs[spin][bra]
+    xk = td1.xs[spin][ket] * np.sign(td1.xs[spin][ket] @ td0.xs[spin][ket])
+    return xb @ xk + np.sum(eps * _tdm.transition_dm(xb, xk, blocks, core, somo, virt).T)
+
+def _check_fd(test, key, spin, damping=None, tol=1e-6, pairs=PAIRS, h=1e-4):
+    mf = MF[key]
+    td = _td(mf, spin, damping)
+    w = td.omega[spin]
+    for ket, bra in pairs:
+        test.assertGreater(abs(w[ket] - w[bra]), 1e-3)
+    grids = _frozen(mf.grids) if hasattr(mf, 'grids') else None
+    dm0 = mf.make_rdm1()
+    v = np.random.default_rng(19).standard_normal((mol.natm, 3))
+    c0 = mol.atom_coords()
+    tds = [_td(_scf(key, mol.set_geom_(c0 + s * h * v, unit='Bohr', inplace=False), grids, dm0), spin, damping)
+           for s in (1, -1)]
+    nac = td.nac_method()
+    for ket, bra in pairs:
+        d = nac.kernel(state=(ket, bra), spin=spin)
+        fd = (_overlap(td, tds[0], ket, bra, spin) - _overlap(td, tds[1], ket, bra, spin)) / (2 * h)
+        test.assertAlmostEqual(np.sum(d * v), fd, delta=tol)
+
+class KnownValues(unittest.TestCase):
+    def test_nac_vs_fd(self):
+        for key in ('hf', 'hf_nodf'):
+            _check_fd(self, key, 0)
+
+    def test_nac_damped_vs_fd(self):
+        for key, damping in (('ks', (1., 8.)), ('hf', (0.9, 5.0)), ('pbe', (1., 8.))):
+            _check_fd(self, key, 0, damping, tol=5e-6)
+
+    def test_nac_vs_fd_rsh_slow(self):
+        _check_fd(self, 'cam', 1)
+        _check_fd(self, 'ks', 1, (1., 8.))
+
+    def test_nac_antisymmetry_and_etf(self):
+        td = _td(MF['hf'], 0)
+        nac = td.nac_method()
+        d10 = nac.kernel(state=(1, 0), spin=0)
+        self.assertLess(abs(d10 + nac.kernel(state=(0, 1))).max(), 1e-9)
+        h10 = nac.kernel(state=(1, 0), mult_ediff=True)
+        self.assertLess(abs(h10 - nac.kernel(state=(0, 1))).max(), 1e-10)     # mult_ediff persists
+        self.assertLess(abs(h10 - (td.omega[0][1] - td.omega[0][0]) * d10).max(), 1e-10)
+        self.assertGreater(abs(d10.sum(0)).max(), 1e-3)                        # AO term breaks translation inv.
+        d_etf = nac.kernel(state=(1, 0), mult_ediff=False, use_etfs=True)
+        self.assertLess(abs(d_etf.sum(0)).max(), 1e-10)                        # HF only (F2)
+        self.assertEqual(abs(nac.kernel(state=(2, 2))).max(), 0)
+
+
+if __name__ == "__main__":
+    print("Full Tests for SF-XTDA non-adiabatic couplings")
+    unittest.main()

@@ -414,6 +414,7 @@ class SFXTDA(lib.StreamObject):
         transition_dipole(spin, i) : <i|r|j> for every root j (origin at the nuclear charge centre)
         oscillator_strength(spin, i) : 2/3 (omega_j - omega_i) |<i|r|j>|^2 for every root j
         nuc_grad_method() : analytic nuclear gradients of one root (pyscf.grad.sfxtda)
+        nac_method() : analytic non-adiabatic couplings between two roots of one spin (pyscf.nac.sfxtda)
     Near-degenerate roots mix within their subspace depending on the Davidson convergence: their
     individual TDMs and f are not well defined, only sums over the near-degenerate set are.
     '''
@@ -492,6 +493,10 @@ class SFXTDA(lib.StreamObject):
     def nuc_grad_method(self):
         from pyscf.grad import sfxtda as sfxtda_grad
         return sfxtda_grad.Gradients(self)
+
+    def nac_method(self):
+        from pyscf.nac import sfxtda as sfxtda_nac
+        return sfxtda_nac.NonAdiabaticCouplings(self)
 
     Gradients = nuc_grad_method
 

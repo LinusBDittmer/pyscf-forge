@@ -16,6 +16,6 @@
 # Author: Linus B. Dittmer <linus.dittmer@stud.uni-heidelberg.de>
 #
 
-'''Spin-flip extended TDA (ROKS SF-XCIS) with density fitting and a Davidson solver.'''
+'''Triple-triplet extended TDA (ROKS SF-XCIS) with density fitting and a Davidson solver.'''
 
-from pyscf.sfxtda.sfxtda import SFXTDA
+from pyscf.xtda_3t.xtda_3t import XTDA_3T

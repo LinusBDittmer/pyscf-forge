@@ -17,14 +17,14 @@
 #
 
 '''
-Analytic nuclear gradients of one SF-XTDA root, E = E_ROKS + omega.
+Analytic nuclear gradients of one XTDA-3T root, E = E_ROKS + omega.
 
 omega = x.(H - E0).x is a Rayleigh quotient, so the root vector x needs no response.  H - E0 is linear in
 the spin-averaged Fock matrix Fbar and in the integrals [pq|rs] = sum_t c_t (pq|rs)_t of the kernel w:
 
     omega = tr(P Fbar) + sum Gamma_pqrs [pq|rs],   P = gamma^{kk} - gamma0   (gamma0 = 2 on C, 1 on O).
 
-The two-body part is contracted with own DF fits (pyscf.sfxtda._rdm2), T_t = (P|pq)_t, d_t = j2c_t^-1 T_t:
+The two-body part is contracted with own DF fits (pyscf.xtda_3t._rdm2), T_t = (P|pq)_t, d_t = j2c_t^-1 T_t:
 
     Ghat_t = 2 c_t Y[d_t],   omega_2e = 1/2 sum_t <Ghat_t, T_t>,   M_t = sum_pq Ghat_t^P d_t^Q.
 
@@ -37,11 +37,12 @@ non-redundant pairs (VC, VO, OC) gives Z_t; Q_t = P/2 + Z_t, W = (X^L + X^L^T)/4
 
     dE/dA = dE_ROKS/dA + d/dA sum_t tr(Q_t F_t[D])|skeleton + own DF derivative - tr(W_AO S^(A)).
 
-Damping (td.damping = (p1, p2)): omega = x.Htilde.x with Htilde_KL = f_KL H_KL on pairs touching a small CSF,
-f_KL = p1 exp(-p2 (d_K - d_L)^4), d_K = H_KK.  Then d omega = sum W_KL dH_KL with W = x x^T + dW,
+Damping (td.damping = (p2, n)): omega = x.Htilde.x with Htilde_KL = f_KL H_KL on pairs touching a small CSF,
+f_KL = f(d_K - d_L) = 1/(1 + y arctan y), y = (p2 |d_K - d_L|)^n, d_K = H_KK.  Then d omega = sum W_KL dH_KL with
+W = x x^T + dW,
 
     dW_ss = x_s x_s^T o (f_ss - 1) + diag(g_s),   dW_sl = x_s x_l^T o (f_sl - 1),   dW_ll = diag(g_l),
-    g_K = 2 sum_L a_KL,   a_KL = x_K x_L H_KL f_KL (-4 p2 (d_K - d_L)^3),
+    g_K = 2 sum_L a_KL,   a_KL = x_K x_L H_KL f'(d_K - d_L),
 
 contracted into P and Ghat_t by _tdm.weighted_dm and _rdm2.contract_weighted.  The d_K are not invariant under
 rotations inside C, O and V; td.mo_coeff fixes them by Fbar_rp = 0, whose multipliers enter P as
@@ -49,7 +50,7 @@ Pz_rp = -A_rp / (2 (eps_r - eps_p)), A = X - X^T (pairs degenerate within 1e-6 a
 A_rp is not negligible).  Grid response of the XC terms is omitted (as in pyscf.grad.tduks).
 
 The densities are bilinear in two roots (state2), and _relaxed takes an extra antisymmetric Lagrangian term:
-pyscf.nac.sfxtda reuses both.
+pyscf.nac.xtda_3t reuses both.
 '''
 
 import types
@@ -59,7 +60,7 @@ from pyscf.lib import logger
 from pyscf.df.grad import rhf as df_grad
 from pyscf.grad import rhf as rhf_grad
 from pyscf.grad import tduks as tduks_grad
-from pyscf.sfxtda import sfxtda, _rdm2, _tdm
+from pyscf.xtda_3t import xtda_3t, _rdm2, _tdm
 
 
 def _occupations(td):
@@ -98,11 +99,11 @@ def _df_terms(mol, auxmol, mo_coeff, terms):
 
 def _two_body(td, x, spin, dfterms, x2=None):
     core, somo, virt = td._orbs
-    blocks = sfxtda.csf_list(spin, len(core), len(virt))
+    blocks = xtda_3t.csf_list(spin, len(core), len(virt))
     return [2 * c * _rdm2.contract(x, blocks, d, core, somo, virt, x2) for c, _, _, d in dfterms]
 
 
-def _damping_weights(x, hss, hsl, d_small, d_large, p1, p2, x2=None):
+def _damping_weights(x, hss, hsl, d_small, d_large, p2, n=5, x2=None):
     '''dW of the damped bilinear form x.Htilde.x2 (undamped hss, hsl): d(x.Htilde.x2) = sum (S + dW) dH with the
     symmetric S = (x x2^T + x2 x^T)/2 (x2 = None: x2 = x, the damped Rayleigh quotient).
 
@@ -111,12 +112,12 @@ def _damping_weights(x, hss, hsl, d_small, d_large, p1, p2, x2=None):
     ns = hss.shape[0]
     if x2 is None:
         x2 = x
-    fss, fsl = sfxtda.damping_factors(d_small, d_large, p1, p2)
-    # ponytail: about five (ns, nl) arrays live at once, the size of hsl; block over large columns if memory matters
+    (fss, dfss), (fsl, dfsl) = xtda_3t.damping_factors(d_small, d_large, p2, n, deriv=True)
+    # ponytail: about six (ns, nl) arrays live at once, the size of hsl; block over large columns if memory matters
     oss = .5 * (numpy.outer(x[:ns], x2[:ns]) + numpy.outer(x2[:ns], x[:ns]))
     osl = .5 * (numpy.outer(x[:ns], x2[ns:]) + numpy.outer(x2[:ns], x[ns:]))
-    a_ss = oss * hss * fss * (-4 * p2 * (d_small[:, None] - d_small[None, :])**3)
-    a_sl = osl * hsl * fsl * (-4 * p2 * (d_small[:, None] - d_large[None, :])**3)
+    a_ss = oss * hss * dfss
+    a_sl = osl * hsl * dfsl
     gs = 2 * (a_ss.sum(1) + a_sl.sum(1))
     gl = -2 * a_sl.sum(0)
     return oss * (fss - 1), osl * (fsl - 1), gs, gl
@@ -129,7 +130,7 @@ def _state_densities(td, spin, state, dfterms, state2=None):
     x = td.xs[spin][state]
     x2 = None if state2 is None else td.xs[spin][state2]
     core, somo, virt = td._orbs
-    blocks = sfxtda.csf_list(spin, len(core), len(virt))
+    blocks = xtda_3t.csf_list(spin, len(core), len(virt))
     y = x if x2 is None else x2
     dm = _tdm.transition_dm(x, y, blocks, core, somo, virt)
     g0 = numpy.zeros(len(dm))
@@ -139,8 +140,8 @@ def _state_densities(td, spin, state, dfterms, state2=None):
     if td.damping is None:
         return p, ghats
     ints = td._ints
-    hss, hsl = sfxtda.build_small(ints, spin)
-    hdl = sfxtda.hdiag_large(ints, *sfxtda.cvcv_operator(ints, spin))
+    hss, hsl = xtda_3t.build_small(ints, spin)
+    hdl = xtda_3t.hdiag_large(ints, *xtda_3t.cvcv_operator(ints, spin))
     wss, wsl, gs, gl = _damping_weights(x, hss, hsl, hss.diagonal().copy(), hdl.ravel(), *td.damping, x2=x2)
     wss = wss + numpy.diag(gs)
     p = p + _tdm.weighted_dm(wss, wsl, gl, blocks, core, somo, virt)
@@ -179,7 +180,7 @@ def _canonical_pz(xo, eps, spaces, log, thresh=1e-6):
         blk[ok] = -asp[ok] / (2 * de[ok])
         pz[numpy.ix_(sp, sp)] = blk
         for r, q in zip(*numpy.nonzero(numpy.triu(deg & (abs(asp) > 1e-6)))):
-            log.warn('SF-XTDA damped model: canonical orbitals %d and %d are degenerate (|de| < %g) but carry a '
+            log.warn('XTDA-3T damped model: canonical orbitals %d and %d are degenerate (|de| < %g) but carry a '
                      'Lagrangian asymmetry of %.2g; the damped roots depend on their arbitrary rotation, the '
                      'derivative is approximate', sp[r], sp[q], thresh, asp[r, q])
     return pz
@@ -255,7 +256,7 @@ def _fock_skeleton(mf, xc_coeffs, q_ao, d_ao, atmlst=None, max_memory=2000):
     de_aux = 0
     if aux:
         de_aux = sum(vj.aux[2 + t, s] + vj.aux[s, 2 + t] for s in range(2) for t in range(2))
-    for c, omega in sfxtda._kernel_terms(*xc_coeffs):
+    for c, omega in xtda_3t._kernel_terms(*xc_coeffs):
         vk = mf_grad.get_k(mol, dms, omega=(omega or None))
         g = g - c * sum(vk[t] * q_ao[t] + vk[2 + t] * d_ao[t] for t in range(2))
         if aux:
@@ -354,7 +355,7 @@ def grad_elec(td_grad, spin, state, atmlst=None):
     '''omega part of the gradient of root `state` of spin `spin` (Lagrangian assembly; no dE_ROKS/dA).'''
     td = td_grad.base
     auxmol = _auxmol(td)
-    dfterms = _df_terms(td_grad.mol, auxmol, td.mo_coeff, sfxtda._kernel_terms(*td.xc_coeffs))
+    dfterms = _df_terms(td_grad.mol, auxmol, td.mo_coeff, xtda_3t._kernel_terms(*td.xc_coeffs))
     p, ghats = _state_densities(td, spin, state, dfterms)
     return _relaxed(td_grad, p, ghats, auxmol, dfterms, atmlst=atmlst)
 
@@ -367,15 +368,15 @@ def _check_root(td, spin, state, log):
     if abs(numpy.linalg.norm(xs[state]) - 1) > 1e-6:
         raise RuntimeError(f'S={spin} root {state} has a non-normalised vector (Davidson subspace collapse)')
     if not td.converged[spin][state]:
-        log.warn('SF-XTDA S=%d root %d not converged', spin, state)
+        log.warn('XTDA-3T S=%d root %d not converged', spin, state)
 
 
 class Gradients(rhf_grad.GradientsBase):
-    '''Analytic nuclear gradients of one SF-XTDA root (total energy E_ROKS + omega).
+    '''Analytic nuclear gradients of one XTDA-3T root (total energy E_ROKS + omega).
 
     Attributes:
         state : int
-            0-based root index within the spin block (as in the SFXTDA log and transition_dm).
+            0-based root index within the spin block (as in the XTDA_3T log and transition_dm).
         spin : int
             Total spin S of the root (default: first entry of td.spins).
         cphf_conv_tol, cphf_max_cycle :
@@ -413,7 +414,7 @@ class Gradients(rhf_grad.GradientsBase):
             self.atmlst = atmlst
         state, spin = self.state, self.spin
         if isinstance(mf, dft.rks.KohnShamDFT) and mf.do_nlc():
-            raise NotImplementedError('SF-XTDA gradients with NLC')
+            raise NotImplementedError('XTDA-3T gradients with NLC')
         if td.xs is None:
             td.kernel()
         log = logger.new_logger(self)
@@ -421,7 +422,7 @@ class Gradients(rhf_grad.GradientsBase):
         w = td.omega[spin]
         near = [j for j in (state - 1, state + 1) if 0 <= j < len(w) and abs(w[j] - w[state]) < 1e-4]
         if near:
-            log.warn('SF-XTDA S=%d root %d near-degenerate with root(s) %s (< 1e-4 Ha): the gradient of a single '
+            log.warn('XTDA-3T S=%d root %d near-degenerate with root(s) %s (< 1e-4 Ha): the gradient of a single '
                      'root is ill-defined', spin, state, near)
         if self.verbose >= logger.INFO:
             self.dump_flags()
@@ -436,7 +437,7 @@ class Gradients(rhf_grad.GradientsBase):
 
     def _finalize(self):
         if self.verbose >= logger.NOTE:
-            logger.note(self, '--------- SF-XTDA gradients for S=%d root %d ----------', self.spin, self.state)
+            logger.note(self, '--------- XTDA-3T gradients for S=%d root %d ----------', self.spin, self.state)
             self._write(self.mol, self.de, self.atmlst)
             logger.note(self, '----------------------------------------------')
 
@@ -445,11 +446,11 @@ class Gradients(rhf_grad.GradientsBase):
         if isinstance(self, lib.GradScanner):
             return self
         logger.info(self, 'Create scanner for %s', self.__class__)
-        name = self.__class__.__name__ + SFXTDA_GradScanner.__name_mixin__
-        return lib.set_class(SFXTDA_GradScanner(self, state, spin), (SFXTDA_GradScanner, self.__class__), name)
+        name = self.__class__.__name__ + XTDA_3T_GradScanner.__name_mixin__
+        return lib.set_class(XTDA_3T_GradScanner(self, state, spin), (XTDA_3T_GradScanner, self.__class__), name)
 
 
-class SFXTDA_GradScanner(lib.GradScanner):
+class XTDA_3T_GradScanner(lib.GradScanner):
     def __init__(self, g, state=None, spin=None):
         lib.GradScanner.__init__(self, g)
         if state is not None:

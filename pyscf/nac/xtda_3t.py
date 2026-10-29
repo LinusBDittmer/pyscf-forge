@@ -17,13 +17,13 @@
 #
 
 '''
-Analytic non-adiabatic couplings d = <bra|d ket/dR> between two SF-XTDA roots of one spin.
+Analytic non-adiabatic couplings d = <bra|d ket/dR> between two XTDA-3T roots of one spin.
 
 |K> = sum_mu x^K_mu |mu(R)> with CSFs on td.mo_coeff.  With dE = omega_ket - omega_bra and h = dE d:
 
     h = d/dR [x^bra.Htilde.x^ket]_x + dE sum_pq G_pq <phi_p|d phi_q/dR>,   G_pq = <bra|E_pq|ket>.
 
-The first term is the gradient Lagrangian of pyscf.grad.sfxtda with x x^T replaced by the symmetric weight
+The first term is the gradient Lagrangian of pyscf.grad.xtda_3t with x x^T replaced by the symmetric weight
 (x^bra x^ket^T + x^ket x^bra^T)/2 (P, Ghat and the damping weight dW are bilinear; E_ROKS drops out since
 x^bra.x^ket = 0).  With C -> C(1 + U), U = kappa - 1/2 C^T S^(A) C,
 
@@ -34,21 +34,21 @@ through the canonical constraint (damped model) and the Z-vector of the gradient
 is dropped with use_etfs (electron translation factors, Fatehi & Subotnik, JPCL 3, 2039 (2012)).  Undamped roots
 do not depend on rotations inside C, O and V, so the intra-space kappa is 0 in both terms.  A NAC transforms as
 the product of the irreps of the two roots and is never symmetrised.  Grid response of the XC terms is omitted
-(as in pyscf.grad.sfxtda).
+(as in pyscf.grad.xtda_3t).
 '''
 
 import numpy
 from pyscf import lib, gto, dft
 from pyscf.lib import logger
 from pyscf.grad import rhf as rhf_grad
-from pyscf.grad import sfxtda as sfxtda_grad
-from pyscf.sfxtda import sfxtda, _tdm
+from pyscf.grad import xtda_3t as xtda_3t_grad
+from pyscf.xtda_3t import xtda_3t, _tdm
 
 
 def nac_elec(nac, spin, ket, bra, atmlst=None, use_etfs=False):
     '''h = (omega_ket - omega_bra) <bra|d ket/dR>, shape (len(atmlst), 3); symmetric in ket and bra.'''
     td = nac.base
-    # follow the SF-XTDA object (the relaxation reads nac.mol): a scanner may have moved it since nac was bound
+    # follow the XTDA-3T object (the relaxation reads nac.mol): a scanner may have moved it since nac was bound
     nac.mol = td.mol
     mol, mo = td.mol, td.mo_coeff
     if atmlst is None:
@@ -56,14 +56,14 @@ def nac_elec(nac, spin, ket, bra, atmlst=None, use_etfs=False):
     core, somo, virt = td._orbs
     xs = td.xs[spin]
     de = td.omega[spin][ket] - td.omega[spin][bra]
-    auxmol = sfxtda_grad._auxmol(td)
-    dfterms = sfxtda_grad._df_terms(mol, auxmol, mo, sfxtda._kernel_terms(*td.xc_coeffs))
-    p, ghats = sfxtda_grad._state_densities(td, spin, bra, dfterms, ket)
+    auxmol = xtda_3t_grad._auxmol(td)
+    dfterms = xtda_3t_grad._df_terms(mol, auxmol, mo, xtda_3t._kernel_terms(*td.xc_coeffs))
+    p, ghats = xtda_3t_grad._state_densities(td, spin, bra, dfterms, ket)
     # G_pq = <bra|E_pq|ket>; transition_dm is <bra|a+_q a_p|ket>
-    g = _tdm.transition_dm(xs[bra], xs[ket], sfxtda.csf_list(spin, len(core), len(virt)), core, somo, virt).T
+    g = _tdm.transition_dm(xs[bra], xs[ket], xtda_3t.csf_list(spin, len(core), len(virt)), core, somo, virt).T
     ga = .5 * (g - g.T)
     # ponytail: one Z-vector per pair; batch the right-hand sides of several pairs if many couplings are needed
-    h = sfxtda_grad._relaxed(nac, p, ghats, auxmol, dfterms, de * ga, atmlst)
+    h = xtda_3t_grad._relaxed(nac, p, ghats, auxmol, dfterms, de * ga, atmlst)
     if not use_etfs:
         s1 = rhf_grad.get_ovlp(mol)
         m = mo @ ga @ mo.T
@@ -75,12 +75,12 @@ def nac_elec(nac, spin, ket, bra, atmlst=None, use_etfs=False):
     return h
 
 
-class NonAdiabaticCouplings(sfxtda_grad.Gradients):
-    '''SF-XTDA non-adiabatic couplings <bra|d ket/dR> between two roots of one spin (pyscf.nac conventions).
+class NonAdiabaticCouplings(xtda_3t_grad.Gradients):
+    '''XTDA-3T non-adiabatic couplings <bra|d ket/dR> between two roots of one spin (pyscf.nac conventions).
 
     Attributes:
         state : (ket, bra)
-            0-based roots within the spin block (as in the SFXTDA log and transition_dm).
+            0-based roots within the spin block (as in the XTDA_3T log and transition_dm).
         spin : int
             Total spin S of both roots (default: first entry of td.spins).
         mult_ediff : bool
@@ -93,12 +93,12 @@ class NonAdiabaticCouplings(sfxtda_grad.Gradients):
 
     Root signs are aligned with the previous kernel() call through MO and CSF overlaps (for dynamics; reset_phase()
     forgets them), so the first call returns the NAC of the roots as computed.  For dynamics, bind the NAC object to
-    a gradient scanner's SF-XTDA object (g.base.nac_method()) to share one SF-XTDA run per geometry.
+    a gradient scanner's XTDA-3T object (g.base.nac_method()) to share one XTDA-3T run per geometry.
     '''
     _keys = {'mult_ediff', 'use_etfs'}
 
     def __init__(self, td):
-        sfxtda_grad.Gradients.__init__(self, td)
+        xtda_3t_grad.Gradients.__init__(self, td)
         self.state = (1, 0)
         self.mult_ediff = False
         self.use_etfs = False
@@ -114,7 +114,7 @@ class NonAdiabaticCouplings(sfxtda_grad.Gradients):
     def kernel(self, state=None, spin=None, atmlst=None, mult_ediff=None, use_etfs=None):
         td = self.base
         mf = td._scf
-        # follow the SF-XTDA object: a gradient scanner sharing it moves td.mol without touching this object
+        # follow the XTDA-3T object: a gradient scanner sharing it moves td.mol without touching this object
         self.mol = td.mol
         if state is not None:
             if numpy.ndim(state) != 1 or len(state) != 2:
@@ -132,12 +132,12 @@ class NonAdiabaticCouplings(sfxtda_grad.Gradients):
             self.atmlst = atmlst
         (ket, bra), spin = self.state, self.spin
         if isinstance(mf, dft.rks.KohnShamDFT) and mf.do_nlc():
-            raise NotImplementedError('SF-XTDA NACs with NLC')
+            raise NotImplementedError('XTDA-3T NACs with NLC')
         if td.xs is None:
             td.kernel()
         log = logger.new_logger(self)
         for k in (ket, bra):
-            sfxtda_grad._check_root(td, spin, k, log)
+            xtda_3t_grad._check_root(td, spin, k, log)
         sign = self._phases(spin)
         if ket == bra:
             self.de = numpy.zeros((self.mol.natm if atmlst is None else len(atmlst), 3))
@@ -150,7 +150,7 @@ class NonAdiabaticCouplings(sfxtda_grad.Gradients):
             self.de = h
         else:
             if abs(de) < 1e-4:
-                log.warn('SF-XTDA S=%d roots %d and %d are %.2g Ha apart: the NAC diverges (use mult_ediff)',
+                log.warn('XTDA-3T S=%d roots %d and %d are %.2g Ha apart: the NAC diverges (use mult_ediff)',
                          spin, ket, bra, abs(de))
             self.de = h / de
         self._finalize()
@@ -170,7 +170,7 @@ class NonAdiabaticCouplings(sfxtda_grad.Gradients):
         if prev is not None:
             mol0, mo0, x0 = prev
             s = numpy.where((mo0.T @ gto.intor_cross('int1e_ovlp', mol0, mol) @ mo).diagonal() < 0, -1., 1.)
-            flip = sfxtda.csf_irreps(sfxtda.csf_list(spin, len(core), len(virt)), (s < 0).astype(int),
+            flip = xtda_3t.csf_irreps(xtda_3t.csf_list(spin, len(core), len(virt)), (s < 0).astype(int),
                                      core, somo, virt)
             mo = mo * s
             xs = xs * (1 - 2. * flip)
@@ -180,7 +180,7 @@ class NonAdiabaticCouplings(sfxtda_grad.Gradients):
             sign[:n] = numpy.where(ov < 0, -1., 1.)
             bad = [k for k in sorted(set(self.state)) if k < n and abs(ov[k]) < .5]
             if bad:
-                logger.warn(self, 'SF-XTDA NAC S=%d roots %s: weak overlap (< 0.5) with the previous call (root swap '
+                logger.warn(self, 'XTDA-3T NAC S=%d roots %s: weak overlap (< 0.5) with the previous call (root swap '
                             'or orbital reordering), their phases may be wrong', spin, bad)
         # a copy: moving the caller's Mole in place must not move the reference geometry
         self._phase_ref[spin] = (mol.copy(), mo, xs * sign[:, None])
@@ -194,7 +194,7 @@ class NonAdiabaticCouplings(sfxtda_grad.Gradients):
     def _finalize(self):
         if self.verbose >= logger.NOTE:
             ket, bra = self.state
-            logger.note(self, '--------- SF-XTDA %s S=%d <%d|d%d/dR> ----------',
+            logger.note(self, '--------- XTDA-3T %s S=%d <%d|d%d/dR> ----------',
                         'h = dE * NAC' if self.mult_ediff else 'NAC', self.spin, bra, ket)
             self._write(self.mol, self.de, self.atmlst)
             logger.note(self, '----------------------------------------------')
@@ -205,11 +205,11 @@ class NonAdiabaticCouplings(sfxtda_grad.Gradients):
         if isinstance(self, lib.GradScanner):
             return self
         logger.info(self, 'Create scanner for %s', self.__class__)
-        name = self.__class__.__name__ + SFXTDA_NACScanner.__name_mixin__
-        return lib.set_class(SFXTDA_NACScanner(self, state, spin), (SFXTDA_NACScanner, self.__class__), name)
+        name = self.__class__.__name__ + XTDA_3T_NACScanner.__name_mixin__
+        return lib.set_class(XTDA_3T_NACScanner(self, state, spin), (XTDA_3T_NACScanner, self.__class__), name)
 
 
-class SFXTDA_NACScanner(lib.GradScanner):
+class XTDA_3T_NACScanner(lib.GradScanner):
     def __init__(self, nac, state=None, spin=None):
         lib.GradScanner.__init__(self, nac)
         self._phase_ref = {}                    # own phases, not shared with the object it was made from

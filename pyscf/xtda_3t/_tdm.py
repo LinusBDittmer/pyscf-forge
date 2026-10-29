@@ -17,7 +17,7 @@
 #
 
 '''
-One-particle (transition) density matrices of SF-XTDA roots in the CSF basis.
+One-particle (transition) density matrices of XTDA-3T roots in the CSF basis.
 
 For two roots |I> = sum_mu x^I_mu |mu>, |J> of the same spin S (E_rs = sum_sigma a+_rs a_ss is a spin
 scalar, so different S never couple and the M_S = 0 components suffice)

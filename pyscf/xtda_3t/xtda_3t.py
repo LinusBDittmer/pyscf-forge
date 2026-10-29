@@ -17,7 +17,7 @@
 #
 
 '''
-SF-XTDA: spin-complete spin-flip extended TDA (ROKS SF-XCIS) on a ROKS/ROHF M_S = +1 triplet.
+XTDA-3T: spin-complete triple-triplet extended TDA (ROKS SF-XCIS) on a ROKS/ROHF M_S = +1 triplet.
 
 Model (spin-free, all states spin-pure):
     H = sum_pq h'_pq E_pq + 1/2 sum [pq|rs] e_pqrs,   h' = Fbar - (J - K_C - K_O/2)[Phi0],
@@ -43,8 +43,8 @@ from pyscf.data.nist import HARTREE2EV
 from pyscf.lib import logger
 from pyscf.tdscf._lr_eig import eigh as lr_eigh
 from pyscf.tdscf.rhf import _charge_center
-from pyscf.sfxtda._blocks import BLOCKS, ORDER, CSF_INFO
-from pyscf.sfxtda import _tdm
+from pyscf.xtda_3t._blocks import BLOCKS, ORDER, CSF_INFO
+from pyscf.xtda_3t import _tdm
 
 # axis of each C/V label in the broadcast shape (bra i, bra a, ket j, ket b)
 _AX = {'i': 0, 'a': 1, 'j': 2, 'b': 3}
@@ -55,14 +55,14 @@ def _reference(mf):
     '''Orbital partition, spin-averaged KS Fock matrix (MO basis) and the exact-exchange kernel
     coefficients (omega, alpha, hyb) of PySCF: w(r) = hyb/r + (alpha - hyb) erf(omega r)/r.'''
     if not isinstance(mf, scf.rohf.ROHF):
-        raise TypeError('SF-XTDA requires a ROHF or ROKS reference')
+        raise TypeError('XTDA-3T requires a ROHF or ROKS reference')
     mol = mf.mol
     mo_occ = mf.mo_occ
     core = numpy.where(mo_occ > 1.5)[0]
     somo = numpy.where((mo_occ > .5) & (mo_occ < 1.5))[0]
     virt = numpy.where(mo_occ < .5)[0]
     if mol.spin != 2 or len(somo) != 2:
-        raise ValueError('SF-XTDA requires the M_S = +1 triplet reference (two singly occupied orbitals)')
+        raise ValueError('XTDA-3T requires the M_S = +1 triplet reference (two singly occupied orbitals)')
     if not mf.converged:
         raise RuntimeError('reference SCF not converged')
     if isinstance(mf, dft.rks.KohnShamDFT):
@@ -342,21 +342,27 @@ def k_contract(ints, t):
     return lib.dot(x, ints.bvv.reshape(naux * nV, nV))
 
 
-def damping_factors(d_small, d_large, p1, p2):
-    '''Damping factors p1*exp(-p2*(H_KK-H_LL)^4): small-small (unit diagonal) and small-large.'''
-    fss = p1 * numpy.exp(-p2 * (d_small[:, None] - d_small[None, :])**4)
-    numpy.fill_diagonal(fss, 1.)
-    fsl = numpy.subtract(d_small[:, None], d_large[None, :])
-    fsl **= 4
-    fsl *= -p2
-    numpy.exp(fsl, out=fsl)
-    fsl *= p1
-    return fss, fsl
+def _damping(delta, p2, n, deriv=False):
+    '''f = 1/(1 + y arctan y), y = (p2 |delta|)^n (f = 1 at delta = 0); with deriv also df/d delta.'''
+    y = (p2 * numpy.abs(delta))**n
+    t = numpy.arctan(y)
+    f = 1. / (1. + y * t)
+    if not deriv:
+        return f
+    dy = n * numpy.divide(y, delta, out=numpy.zeros_like(y), where=delta != 0)
+    return f, -f**2 * (t + y / (1. + y * y)) * dy
 
 
-def damp_(hss, hsl, d_small, d_large, p1, p2):
-    '''In-place damping p1*exp(-p2*(H_KK-H_LL)^4) of the off-diagonal of hss and of all of hsl.'''
-    fss, fsl = damping_factors(d_small, d_large, p1, p2)
+def damping_factors(d_small, d_large, p2, n=5, deriv=False):
+    '''Damping factors of Delta = H_KK - H_LL (Lyskov, Kleinschmidt, Marian, JCP 144, 034104 (2016)):
+    small-small and small-large.  With deriv, each is a pair (f, df/d Delta).'''
+    return (_damping(d_small[:, None] - d_small[None, :], p2, n, deriv),
+            _damping(d_small[:, None] - d_large[None, :], p2, n, deriv))
+
+
+def damp_(hss, hsl, d_small, d_large, p2, n=5):
+    '''In-place damping 1/(1 + y arctan y), y = (p2 |H_KK-H_LL|)^n, of hss and hsl.'''
+    fss, fsl = damping_factors(d_small, d_large, p2, n)
     hss *= fss
     hsl *= fsl
 
@@ -380,18 +386,19 @@ def csf_irreps(blocks, orbsym, core, somo, virt):
     return numpy.concatenate(out)
 
 
-class SFXTDA(lib.StreamObject):
-    '''Spin-complete spin-flip extended TDA (ROKS SF-XCIS) on a ROKS or ROHF M_S = +1 triplet.
+class XTDA_3T(lib.StreamObject):
+    '''Spin-complete triple-triplet extended TDA (ROKS SF-XCIS) on a ROKS or ROHF M_S = +1 triplet.
 
     Attributes:
         nstates : int
             Number of roots per spin (lowest over all irreps, or within wfnsym if set).
         spins : tuple
             Total spins to compute, subset of (0, 1, 2).
-        damping : None or (p1, p2)
-            DFT/MRCI-style damping p1*exp(-p2*dE^4) of every coupling that involves an OO, CO
-            or OV configuration (CV-CV couplings are never damped).  (1.0, 8.0) is recommended
-            for BH&HLYP (fitted there only; no recommended values for range-separated hybrids).
+        damping : None or (p2,) or (p2, n)
+            DFT/MRCI R2016-style damping 1/(1 + y arctan y), y = (p2 |dE|)^n (p2 in 1/Eh, n = 5
+            by default), of every coupling that involves an OO, CO or OV configuration (CV-CV
+            couplings are never damped).  Not fitted yet; (1.9, 5) has the same half-point (0.54 Eh)
+            as the old exp(-8 dE^4) fitted for BH&HLYP.
         wfnsym : str or int
             Restrict the roots to one irrep (requires mol.symmetry).
         auxbasis : str
@@ -413,8 +420,8 @@ class SFXTDA(lib.StreamObject):
         transition_dm(spin, i, j) : dm[p,q] = <i|a+_q a_p|j> (PySCF fci convention), state density if i == j
         transition_dipole(spin, i) : <i|r|j> for every root j (origin at the nuclear charge centre)
         oscillator_strength(spin, i) : 2/3 (omega_j - omega_i) |<i|r|j>|^2 for every root j
-        nuc_grad_method() : analytic nuclear gradients of one root (pyscf.grad.sfxtda)
-        nac_method() : analytic non-adiabatic couplings between two roots of one spin (pyscf.nac.sfxtda)
+        nuc_grad_method() : analytic nuclear gradients of one root (pyscf.grad.xtda_3t)
+        nac_method() : analytic non-adiabatic couplings between two roots of one spin (pyscf.nac.xtda_3t)
     Near-degenerate roots mix within their subspace depending on the Davidson convergence: their
     individual TDMs and f are not well defined, only sums over the near-degenerate set are.
     '''
@@ -468,7 +475,7 @@ class SFXTDA(lib.StreamObject):
         self.mo_coeff = mo_coeff
         self.xc_coeffs = xc_coeffs
         mem = sum(b.nbytes for b in (ints.bcc, ints.bcv, ints.bvv, ints.bo)) / 1e6
-        log.info('SF-XTDA: nC = %d  nV = %d  naux = %d  omega = %g  alpha = %g  hyb = %g  DF tensors %.1f MB',
+        log.info('XTDA-3T: nC = %d  nV = %d  naux = %d  omega = %g  alpha = %g  hyb = %g  DF tensors %.1f MB',
                  ints.nC, ints.nV, ints.naux, *xc_coeffs, mem)
         if mem > self.max_memory:
             log.warn('DF tensors (%.1f MB) exceed max_memory (%d MB)', mem, self.max_memory)
@@ -487,16 +494,16 @@ class SFXTDA(lib.StreamObject):
         if isinstance(self, lib.SinglePointScanner):
             return self
         logger.info(self, 'Set %s as a scanner', self.__class__)
-        name = self.__class__.__name__ + SFXTDA_Scanner.__name_mixin__
-        return lib.set_class(SFXTDA_Scanner(self), (SFXTDA_Scanner, self.__class__), name)
+        name = self.__class__.__name__ + XTDA_3T_Scanner.__name_mixin__
+        return lib.set_class(XTDA_3T_Scanner(self), (XTDA_3T_Scanner, self.__class__), name)
 
     def nuc_grad_method(self):
-        from pyscf.grad import sfxtda as sfxtda_grad
-        return sfxtda_grad.Gradients(self)
+        from pyscf.grad import xtda_3t as xtda_3t_grad
+        return xtda_3t_grad.Gradients(self)
 
     def nac_method(self):
-        from pyscf.nac import sfxtda as sfxtda_nac
-        return sfxtda_nac.NonAdiabaticCouplings(self)
+        from pyscf.nac import xtda_3t as xtda_3t_nac
+        return xtda_3t_nac.NonAdiabaticCouplings(self)
 
     Gradients = nuc_grad_method
 
@@ -640,7 +647,7 @@ class SFXTDA(lib.StreamObject):
             nallowed = hdiag.size - (0 if forbid is None else numpy.count_nonzero(forbid))
             nroots = min(self.nstates, nallowed)
             if nroots == 0:
-                log.note('SF-XTDA S=%d: no CSF in the requested irrep/space, no roots', spin)
+                log.note('XTDA-3T S=%d: no CSF in the requested irrep/space, no roots', spin)
                 self.omega[spin] = self.e_tot[spin] = numpy.zeros(0)
                 self.converged[spin] = numpy.zeros(0, dtype=bool)
                 self.xs[spin] = numpy.zeros((0, hdiag.size))
@@ -679,7 +686,7 @@ class SFXTDA(lib.StreamObject):
         else:
             e0 = 0.
         self.e = {spin: w - e0 for spin, w in self.omega.items()}
-        log.timer('SF-XTDA', *cpu0)
+        log.timer('XTDA-3T', *cpu0)
         self._finalize()
         return self.e
 
@@ -688,7 +695,7 @@ class SFXTDA(lib.StreamObject):
         log.note('f: oscillator strength from the lowest root of the same spin')
         for spin in self.spins:
             if not all(self.converged[spin]):
-                log.warn('SF-XTDA S=%d roots %s not converged', spin,
+                log.warn('XTDA-3T S=%d roots %s not converged', spin,
                          numpy.flatnonzero(~self.converged[spin]).tolist())
             if not len(self.omega[spin]):
                 continue
@@ -710,12 +717,12 @@ def _check_roots(xs, conv, log):
     bad = numpy.flatnonzero(abs(numpy.linalg.norm(xs, axis=1) - 1) > 1e-6)
     if bad.size:
         conv[bad] = False
-        log.warn('SF-XTDA roots %s: non-normalised eigenvectors (Davidson subspace collapse, see conv_tol); '
+        log.warn('XTDA-3T roots %s: non-normalised eigenvectors (Davidson subspace collapse, see conv_tol); '
                  'results invalid', bad.tolist())
     return conv
 
 
-class SFXTDA_Scanner(lib.SinglePointScanner):
+class XTDA_3T_Scanner(lib.SinglePointScanner):
     def __init__(self, td):
         self.__dict__.update(td.__dict__)
         self._scf = td._scf.as_scanner()

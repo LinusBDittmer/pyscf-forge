@@ -17,8 +17,8 @@ import copy
 import unittest
 import numpy as np
 from pyscf import gto, scf, dft
-from pyscf.sfxtda import sfxtda, _tdm
-from pyscf.nac import sfxtda as sfxtda_nac
+from pyscf.xtda_3t import xtda_3t, _tdm
+from pyscf.nac import xtda_3t as xtda_3t_nac
 
 CH2 = "C 0 0 0; H 0.1 1.0 0.5; H -0.2 -0.95 0.35"
 MAKE = {
@@ -53,7 +53,7 @@ def _frozen(grids):
 
 def _td(mf, spin, damping=None, nstates=5):
     '''Roots of one spin with exact eigenvectors (dense vind(1), n ~ 140), signs as from Davidson (D9, F3).'''
-    td = sfxtda.SFXTDA(mf, nstates=nstates, spins=(spin,), damping=damping)
+    td = xtda_3t.XTDA_3T(mf, nstates=nstates, spins=(spin,), damping=damping)
     td.kernel()
     vind, _ = td.gen_vind(spin)
     w, v = np.linalg.eigh(vind(np.eye(td.xs[spin].shape[1])))
@@ -65,7 +65,7 @@ def _td(mf, spin, damping=None, nstates=5):
 def _overlap(td0, td1, ket, bra, spin):
     '''<bra(R0)|ket(R1)> to first order in eps = C0^T S01 C1 - 1 (error even in the step), ket(R1) sign-aligned.'''
     core, somo, virt = td0._orbs
-    blocks = sfxtda.csf_list(spin, len(core), len(virt))
+    blocks = xtda_3t.csf_list(spin, len(core), len(virt))
     eps = td0.mo_coeff.T @ gto.intor_cross('int1e_ovlp', td0.mol, td1.mol) @ td1.mo_coeff
     eps -= np.eye(len(eps))
     xb = td0.xs[spin][bra]
@@ -113,12 +113,12 @@ class KnownValues(unittest.TestCase):
         _check_fd(self, 'hf', 2)
 
     def test_nac_damped_vs_fd(self):
-        for key, damping in (('ks', (1., 8.)), ('hf', (0.9, 5.0)), ('pbe', (1., 8.))):
+        for key, damping in (('ks', (2., 5)), ('hf', (1.7, 4)), ('pbe', (2., 5))):
             _check_fd(self, key, 0, damping, tol=5e-6)
 
     def test_nac_vs_fd_rsh_slow(self):
         _check_fd(self, 'cam', 1)
-        _check_fd(self, 'ks', 1, (1., 8.))
+        _check_fd(self, 'ks', 1, (2., 5))
 
     def test_nac_antisymmetry_and_etf(self):
         td = _td(MF['hf'], 0)
@@ -138,15 +138,15 @@ class KnownValues(unittest.TestCase):
     def test_csf_sign_parity(self):
         '''MO sign flips s change each CSF by the parity of csf_irreps with the flip bits as irreps (F4).'''
         for spin in (0, 1, 2):
-            td = sfxtda.SFXTDA(MF['ks'], spins=(spin,), damping=(1., 8.)).build()
+            td = xtda_3t.XTDA_3T(MF['ks'], spins=(spin,), damping=(2., 5)).build()
             core, somo, virt = td._orbs
-            blocks = sfxtda.csf_list(spin, len(core), len(virt))
+            blocks = xtda_3t.csf_list(spin, len(core), len(virt))
             n = sum(r * c for _, _, (r, c) in blocks)
             h = td.gen_vind(spin)[0](np.eye(n))
             s = np.random.default_rng(spin).choice([-1., 1.], td.mo_coeff.shape[1])
-            sig = 1 - 2. * sfxtda.csf_irreps(blocks, (s < 0).astype(int), core, somo, virt)
-            td._ints = sfxtda._DFInts(td._with_df, td.mo_coeff * s, core, somo, virt, td._ints.fbar * np.outer(s, s),
-                                      sfxtda._kernel_terms(*td.xc_coeffs))
+            sig = 1 - 2. * xtda_3t.csf_irreps(blocks, (s < 0).astype(int), core, somo, virt)
+            td._ints = xtda_3t._DFInts(td._with_df, td.mo_coeff * s, core, somo, virt, td._ints.fbar * np.outer(s, s),
+                                      xtda_3t._kernel_terms(*td.xc_coeffs))
             self.assertLess(abs(td.gen_vind(spin)[0](np.eye(n)) - sig[:, None] * h * sig).max(), 1e-12)
 
     def test_phase_tracking(self):
@@ -156,7 +156,7 @@ class KnownValues(unittest.TestCase):
         ref = nac.kernel(state=(1, 0), spin=0)
         core, somo, virt = td._orbs
         s = np.where(np.arange(td.mo_coeff.shape[1]) % 3 == 0, -1., 1.)
-        sig = 1 - 2. * sfxtda.csf_irreps(sfxtda.csf_list(0, len(core), len(virt)), (s < 0).astype(int),
+        sig = 1 - 2. * xtda_3t.csf_irreps(xtda_3t.csf_list(0, len(core), len(virt)), (s < 0).astype(int),
                                          core, somo, virt)
         td.mo_coeff = td.mo_coeff * s              # undamped NAC path reads only mo_coeff and xs
         td.xs[0] = td.xs[0] * sig
@@ -195,7 +195,7 @@ class KnownValues(unittest.TestCase):
         ref = nac2.kernel(state=(1, 0), spin=0)
         core, somo, virt = td2._orbs
         s = np.where(np.arange(td2.mo_coeff.shape[1]) % 3 == 1, -1., 1.)
-        sig = 1 - 2. * sfxtda.csf_irreps(sfxtda.csf_list(0, len(core), len(virt)), (s < 0).astype(int),
+        sig = 1 - 2. * xtda_3t.csf_irreps(xtda_3t.csf_list(0, len(core), len(virt)), (s < 0).astype(int),
                                          core, somo, virt)
         td2.mo_coeff = td2.mo_coeff * s              # undamped NAC path reads only mo_coeff and xs
         td2.xs[0] = td2.xs[0] * sig
@@ -207,7 +207,7 @@ class KnownValues(unittest.TestCase):
     def test_nac_hooks_and_errors(self):
         td = _td(MF['hf'], 0)
         nac = td.nac_method()
-        self.assertIsInstance(nac, sfxtda_nac.NonAdiabaticCouplings)
+        self.assertIsInstance(nac, xtda_3t_nac.NonAdiabaticCouplings)
         for bad in (1, (0, 1, 2)):
             with self.assertRaises(ValueError):
                 nac.kernel(state=bad, spin=0)
@@ -225,11 +225,11 @@ class KnownValues(unittest.TestCase):
         mfn = dft.ROKS(mol, xc='B3LYP')
         mfn.nlc = 'vv10'                         # do_nlc() only recognises the lower-case value
         with self.assertRaises(NotImplementedError):
-            sfxtda_nac.NonAdiabaticCouplings(sfxtda.SFXTDA(mfn)).kernel()
+            xtda_3t_nac.NonAdiabaticCouplings(xtda_3t.XTDA_3T(mfn)).kernel()
 
     def test_nac_near_degenerate_warning(self):
         import io
-        td = sfxtda.SFXTDA(MF['hf'], nstates=4, spins=(1,))
+        td = xtda_3t.XTDA_3T(MF['hf'], nstates=4, spins=(1,))
         td.conv_tol = 1e-9
         td.kernel()
         self.assertLess(abs(td.omega[1][2] - td.omega[1][1]), 1e-4)  # 4.9e-5 Ha apart (test_tdm_vs_detci)
@@ -246,7 +246,7 @@ class KnownValues(unittest.TestCase):
         res = []
         for sym in (True, False):
             m = gto.M(atom=atom, basis='6-31g', spin=2, symmetry=sym, verbose=0)
-            td = sfxtda.SFXTDA(scf.ROHF(m).density_fit().run(conv_tol=1e-12, conv_tol_grad=1e-10),
+            td = xtda_3t.XTDA_3T(scf.ROHF(m).density_fit().run(conv_tol=1e-12, conv_tol_grad=1e-10),
                                nstates=4, spins=(0,))
             td.conv_tol = 1e-8
             td.kernel()
@@ -264,7 +264,7 @@ class KnownValues(unittest.TestCase):
         mf = MF['ks']
         res = []
         for rot in (False, True):
-            td = sfxtda.SFXTDA(mf, nstates=4, spins=(0,))
+            td = xtda_3t.XTDA_3T(mf, nstates=4, spins=(0,))
             td.conv_tol = 1e-10
             td.build()
             if rot:
@@ -274,14 +274,14 @@ class KnownValues(unittest.TestCase):
                 for sp in (core, somo, virt):
                     u[np.ix_(sp, sp)] = np.linalg.qr(rng.standard_normal((sp.size, sp.size)))[0]
                 td.mo_coeff = td.mo_coeff @ u
-                td._ints = sfxtda._DFInts(td._with_df, td.mo_coeff, core, somo, virt, u.T @ td._ints.fbar @ u,
-                                          sfxtda._kernel_terms(*td.xc_coeffs))
+                td._ints = xtda_3t._DFInts(td._with_df, td.mo_coeff, core, somo, virt, u.T @ td._ints.fbar @ u,
+                                          xtda_3t._kernel_terms(*td.xc_coeffs))
             td.kernel()
             res.append(td.nac_method().kernel(state=(1, 0), spin=0))
         self.assertGreater(abs(res[0]).max(), 1e-2)
         self.assertAlmostEqual(_same_up_to_sign(*res), 0, 7)
-        a = _td(mf, 0, (1., 8.)).nac_method().kernel(state=(1, 0), spin=0)
-        b = _td(_rotated(mf, 3), 0, (1., 8.)).nac_method().kernel(state=(1, 0), spin=0)
+        a = _td(mf, 0, (2., 5)).nac_method().kernel(state=(1, 0), spin=0)
+        b = _td(_rotated(mf, 3), 0, (2., 5)).nac_method().kernel(state=(1, 0), spin=0)
         self.assertAlmostEqual(_same_up_to_sign(a, b), 0, 7)
 
     def test_nac_scanner(self):
@@ -290,7 +290,7 @@ class KnownValues(unittest.TestCase):
 
         def fresh(m):
             # own SCF: the SCF scanner shares (and rebuilds) with_df with the object it was made from
-            td = sfxtda.SFXTDA(_scf('hf', m), nstates=4, spins=(0,))
+            td = xtda_3t.XTDA_3T(_scf('hf', m), nstates=4, spins=(0,))
             td.conv_tol = 1e-7
             return td.run()
         nac0 = fresh(mol).nac_method()
@@ -304,7 +304,7 @@ class KnownValues(unittest.TestCase):
         self.assertAlmostEqual(_same_up_to_sign(d2, ref), 0, 5)
         self.assertGreater(np.sum(d2 * d0), 0)                   # tracked phases: continuous along the path
         self.assertEqual(nac0._phase_ref, {})                    # the scanner tracks its own phases
-        # NAMD loop without a second SF-XTDA run: NAC bound to the gradient scanner's SF-XTDA object
+        # NAMD loop without a second XTDA-3T run: NAC bound to the gradient scanner's XTDA-3T object
         g = fresh(mol).nuc_grad_method().as_scanner(state=1, spin=0)
         nac = g.base.nac_method()
         g(mol2)
@@ -313,10 +313,10 @@ class KnownValues(unittest.TestCase):
         stale = g.base.nac_method()                              # bound at mol, then moved without kernel()
         g(mol2)
         w = g.base.omega[0]
-        h = sfxtda_nac.nac_elec(stale, 0, 1, 0)
+        h = xtda_3t_nac.nac_elec(stale, 0, 1, 0)
         self.assertAlmostEqual(_same_up_to_sign(h, (w[1] - w[0]) * ref), 0, 5)
 
 
 if __name__ == "__main__":
-    print("Full Tests for SF-XTDA non-adiabatic couplings")
+    print("Full Tests for XTDA-3T non-adiabatic couplings")
     unittest.main()

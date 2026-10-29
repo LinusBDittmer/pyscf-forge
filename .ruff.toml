@@ -32,4 +32,4 @@ line-ending = "auto"
 quote-style = "single"
 
 [lint.per-file-ignores]
-"pyscf/sfxtda/_blocks.py" = ["E501"]
+"pyscf/xtda_3t/_blocks.py" = ["E501"]

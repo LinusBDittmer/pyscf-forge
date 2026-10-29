@@ -17,7 +17,7 @@
 #
 
 '''
-Effective two-body density of an SF-XTDA vector, contracted with a symmetric 3-index tensor.
+Effective two-body density of an XTDA-3T vector, contracted with a symmetric 3-index tensor.
 
 Every _blocks.py formula is linear in the integrals [pq|rs], so x.(H - E0)^{2e}.x = sum Gamma_pqrs [pq|rs].
 For a symmetric F (K, nmo, nmo)
@@ -43,9 +43,9 @@ contract(x, ..., x2) takes the symmetric weight (x x2^T + x2 x^T)/2 (transition 
 
 import itertools
 import numpy
-from pyscf.sfxtda._blocks import BLOCKS
-from pyscf.sfxtda._tdm import _BRA, _KET, _ren, _wsub, _layout, weight_blocks
-from pyscf.sfxtda.sfxtda import _labels
+from pyscf.xtda_3t._blocks import BLOCKS
+from pyscf.xtda_3t._tdm import _BRA, _KET, _ren, _wsub, _layout, weight_blocks
+from pyscf.xtda_3t.xtda_3t import _labels
 
 _DELTAS = ('delta_ij', 'delta_ab')
 

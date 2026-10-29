@@ -19,10 +19,10 @@ import unittest
 import numpy as np
 from pyscf import gto, scf, dft, lib, symm
 from pyscf.data.nist import HARTREE2EV
-from pyscf.sfxtda import sfxtda
-from pyscf.sfxtda._blocks import BLOCKS
-from pyscf.sfxtda import _tdm
-from pyscf.sfxtda import _rdm2
+from pyscf.xtda_3t import xtda_3t
+from pyscf.xtda_3t._blocks import BLOCKS
+from pyscf.xtda_3t import _tdm
+from pyscf.xtda_3t import _rdm2
 
 CH2 = "C 0 0 0; H 0.1 1.0 0.5; H -0.2 -0.95 0.35"
 
@@ -62,7 +62,7 @@ def _dense(td, spin, damping=None):
     '''Dense <K|H-E0|L> from _blocks.py with the module's DF integrals; noCVCV damping.'''
     ints = td._ints
     nC, nV = ints.nC, ints.nV
-    blocks = sfxtda.csf_list(spin, nC, nV)
+    blocks = xtda_3t.csf_list(spin, nC, nV)
     off = np.cumsum([0] + [r * c for _, _, (r, c) in blocks])
     M = np.zeros((off[-1], off[-1]))
     ints.allow_4index = True
@@ -78,7 +78,8 @@ def _dense(td, spin, damping=None):
         cid = _config_ids(blocks, nC, nV)
         cv = np.concatenate([np.full(r * c, cl == 'CV') for cl, _, (r, c) in blocks])
         d = M.diagonal().copy()
-        fac = damping[0] * np.exp(-damping[1] * (d[:, None] - d[None, :])**4)
+        y = (damping[0] * abs(d[:, None] - d[None, :]))**damping[1]
+        fac = 1 / (1 + y * np.arctan(y))
         M *= np.where((cid[:, None] != cid[None, :]) & ~(cv[:, None] & cv[None, :]), fac, 1.)
     return M
 
@@ -86,7 +87,7 @@ def _full_b(td):
     '''Signed DF factors (naux, nmo, nmo) of td's kernel terms, stacked as in _DFInts.'''
     mo = td.mo_coeff
     bs, signs = [], []
-    for c, o in sfxtda._kernel_terms(*td.xc_coeffs):
+    for c, o in xtda_3t._kernel_terms(*td.xc_coeffs):
         with (contextlib.nullcontext(td._with_df) if o == 0 else td._with_df.range_coulomb(o)) as d:
             for eri1 in d.loop():
                 b = lib.unpack_tril(eri1)
@@ -122,14 +123,14 @@ def _dense_w(wss, wsl, gl):
     return w
 
 def _sizes(spin, nC, nV):
-    small, large = sfxtda._split(spin, nC, nV)
+    small, large = xtda_3t._split(spin, nC, nV)
     return sum(r * c for _, _, (r, c) in small), sum(r * c for _, _, (r, c) in large)
 
 class KnownValues(unittest.TestCase):
     def test_reference(self):
         for mf, coeffs in ((mf_hf, (0, 1, 1)), (mf_ks, (0, .5, .5)), (mf_pbe, (0, 0, 0)),
                            (mf_cam, (.33, .65, .19)), (mf_hse, (.11, 0, .25))):
-            C, core, somo, virt, fbar, xc = sfxtda._reference(mf)
+            C, core, somo, virt, fbar, xc = xtda_3t._reference(mf)
             self.assertEqual((len(core), len(somo), len(virt)), (3, 2, 8))
             self.assertAlmostEqual(abs(np.subtract(xc, coeffs)).max(), 0, 12)
             v = mf.get_veff(mol, mf.make_rdm1())
@@ -138,12 +139,12 @@ class KnownValues(unittest.TestCase):
 
     def test_bad_reference(self):
         with self.assertRaises(TypeError):
-            sfxtda._reference(dft.UKS(mol, xc='BHANDHLYP').run())
+            xtda_3t._reference(dft.UKS(mol, xc='BHANDHLYP').run())
         with self.assertRaises(ValueError):
-            sfxtda._reference(scf.ROHF(gto.M(atom=CH2, basis='6-31g', verbose=0)).run())
+            xtda_3t._reference(scf.ROHF(gto.M(atom=CH2, basis='6-31g', verbose=0)).run())
 
     def test_df_tensors(self):
-        td = sfxtda.SFXTDA(mf_ks).build()
+        td = xtda_3t.XTDA_3T(mf_ks).build()
         ints = td._ints
         C = td.mo_coeff
         cc, cv = C[:, ints.core], C[:, ints.virt]
@@ -165,7 +166,7 @@ class KnownValues(unittest.TestCase):
             ints.value('(ia|jb)')
 
     def test_kernel_terms(self):
-        kt = sfxtda._kernel_terms
+        kt = xtda_3t._kernel_terms
         self.assertEqual(kt(0, .5, .5), [(.5, 0)])
         self.assertEqual(kt(0, 0, 0), [])
         self.assertEqual(kt(.11, 0, .25), [(.25, -.11)])
@@ -178,7 +179,7 @@ class KnownValues(unittest.TestCase):
 
     def test_rsh_df_integrals(self):
         for mf in (mf_cam, mf_lc, mf_hse, mf_neg):
-            td = sfxtda.SFXTDA(mf).build()
+            td = xtda_3t.XTDA_3T(mf).build()
             self.assertEqual(mol.omega, 0)      # range_coulomb restored
             ints = td._ints
             C = td.mo_coeff
@@ -187,7 +188,7 @@ class KnownValues(unittest.TestCase):
                 '''[pq|rs] from the SCF's own fits via ao2mo.'''
                 shape = [c.shape[1] for c in cs]
                 out = 0
-                for c, o in sfxtda._kernel_terms(*td.xc_coeffs):
+                for c, o in xtda_3t._kernel_terms(*td.xc_coeffs):
                     if o == 0:
                         out = out + c * mf.with_df.ao2mo(cs, compact=False).reshape(shape)
                     else:
@@ -207,42 +208,42 @@ class KnownValues(unittest.TestCase):
 
     def test_explicit_blocks(self):
         for mf in (mf_hf, mf_ks):
-            td = sfxtda.SFXTDA(mf).build()
+            td = xtda_3t.XTDA_3T(mf).build()
             ints = td._ints
             for spin in (0, 1, 2):
                 M = _dense(td, spin)
-                hss, hsl = sfxtda.build_small(ints, spin)
+                hss, hsl = xtda_3t.build_small(ints, spin)
                 ns = hss.shape[0]
                 self.assertEqual(ns, {0: 3 + 2*3 + 2*8, 1: 1 + 2*3 + 2*8, 2: 0}[spin])
                 self.assertAlmostEqual(abs(hss - M[:ns, :ns]).max(initial=0), 0, 12)
                 self.assertAlmostEqual(abs(hsl - M[:ns, ns:]).max(initial=0), 0, 12)
-                lc, rv, cj, ck = sfxtda.cvcv_operator(ints, spin)
+                lc, rv, cj, ck = xtda_3t.cvcv_operator(ints, spin)
                 self.assertAlmostEqual(abs(lc - lc.T).max(), 0, 12)
                 self.assertAlmostEqual(abs(rv - rv.T).max(), 0, 12)
-                hd = sfxtda.hdiag_large(ints, lc, rv, cj, ck)
+                hd = xtda_3t.hdiag_large(ints, lc, rv, cj, ck)
                 self.assertAlmostEqual(abs(hd.ravel() - M.diagonal()[ns:]).max(), 0, 12)
 
     def test_3oo_diagonal_zero(self):
-        hss, _ = sfxtda.build_small(sfxtda.SFXTDA(mf_ks).build()._ints, 1)
+        hss, _ = xtda_3t.build_small(xtda_3t.XTDA_3T(mf_ks).build()._ints, 1)
         self.assertAlmostEqual(hss[0, 0], 0, 12)   # 3OO is the first S=1 CSF
 
     def test_jk_contract(self):
         for mf in (mf_ks, mf_neg):
-            ints = sfxtda.SFXTDA(mf).build()._ints
+            ints = xtda_3t.XTDA_3T(mf).build()._ints
             nC, nV = ints.nC, ints.nV
             t = np.random.default_rng(1).random((2, nC, nV))
             ints.allow_4index = True
             iajb = np.broadcast_to(ints.value('(ia|jb)'), (nC, nV, nC, nV))
             ijab = np.broadcast_to(ints.value('(ij|ab)'), (nC, nV, nC, nV))
             ints.allow_4index = False
-            self.assertAlmostEqual(abs(sfxtda.j_contract(ints, t) - np.einsum('iajb,mjb->mia', iajb, t)).max(), 0, 12)
-            self.assertAlmostEqual(abs(sfxtda.k_contract(ints, t[0]) - np.einsum('iajb,jb->ia', ijab, t[0])).max(),
+            self.assertAlmostEqual(abs(xtda_3t.j_contract(ints, t) - np.einsum('iajb,mjb->mia', iajb, t)).max(), 0, 12)
+            self.assertAlmostEqual(abs(xtda_3t.k_contract(ints, t[0]) - np.einsum('iajb,jb->ia', ijab, t[0])).max(),
                                    0, 12)
 
     def test_rsh_sigma_vs_dense(self):
         for mf in (mf_cam, mf_lc, mf_hse, mf_neg):
-            for damping in (None, (1.0, 8.0)):
-                td = sfxtda.SFXTDA(mf, damping=damping).build()
+            for damping in (None, (2., 5)):
+                td = xtda_3t.XTDA_3T(mf, damping=damping).build()
                 for spin in (0, 1, 2):
                     M = _dense(td, spin, damping)
                     vind, hdiag = td.gen_vind(spin)
@@ -251,8 +252,8 @@ class KnownValues(unittest.TestCase):
 
     def test_sigma_vs_dense(self):
         for mf in (mf_hf, mf_ks, mf_pbe):
-            for damping in (None, (1.0, 8.0)):
-                td = sfxtda.SFXTDA(mf, damping=damping).build()
+            for damping in (None, (2., 5)):
+                td = xtda_3t.XTDA_3T(mf, damping=damping).build()
                 for spin in (0, 1, 2):
                     M = _dense(td, spin, damping)
                     vind, hdiag = td.gen_vind(spin)
@@ -261,8 +262,8 @@ class KnownValues(unittest.TestCase):
 
     def test_eigenvalues(self):
         for mf in (mf_hf, mf_ks):
-            for damping in (None, (1.0, 8.0)):
-                td = sfxtda.SFXTDA(mf, nstates=4, spins=(0, 1, 2), damping=damping)
+            for damping in (None, (2., 5)):
+                td = xtda_3t.XTDA_3T(mf, nstates=4, spins=(0, 1, 2), damping=damping)
                 td.conv_tol = 1e-7
                 td.kernel()
                 for spin in (0, 1, 2):
@@ -273,7 +274,7 @@ class KnownValues(unittest.TestCase):
                 self.assertAlmostEqual(td.e[0][0], 0, 12)
 
     def test_nstates_exceeds_dimension(self):
-        td = sfxtda.SFXTDA(mf_ks, nstates=100, spins=(2,))
+        td = xtda_3t.XTDA_3T(mf_ks, nstates=100, spins=(2,))
         td.conv_tol = 1e-7
         td.kernel()
         ref = np.linalg.eigvalsh(_dense(td, 2))
@@ -285,12 +286,12 @@ class KnownValues(unittest.TestCase):
         h2o = gto.M(atom="O 0 0 -0.0699; H 0 0.7575 0.5184; H 0 -0.7575 0.5184",
                     basis='6-31g', spin=2, symmetry=True, verbose=0)
         mf = dft.ROKS(h2o, xc='BHANDHLYP').density_fit().run(conv_tol=1e-11)
-        td = sfxtda.SFXTDA(mf, nstates=6, spins=(0,))
+        td = xtda_3t.XTDA_3T(mf, nstates=6, spins=(0,))
         td.conv_tol = 1e-7
         td.kernel()
         M = _dense(td, 0)
         self.assertAlmostEqual(abs(td.omega[0] - np.linalg.eigvalsh(M)[:6]).max(), 0, 9)
-        td2 = sfxtda.SFXTDA(mf, nstates=3, spins=(0,))
+        td2 = xtda_3t.XTDA_3T(mf, nstates=3, spins=(0,))
         td2.conv_tol = 1e-7
         td2.wfnsym = 'B1'
         td2.kernel()
@@ -300,13 +301,13 @@ class KnownValues(unittest.TestCase):
 
     def test_invalid_spins(self):
         with self.assertRaisesRegex(ValueError, 'spins'):
-            sfxtda.SFXTDA(mf_ks, spins=(0, 3)).kernel()
+            xtda_3t.XTDA_3T(mf_ks, spins=(0, 3)).kernel()
 
     def test_wfnsym_edge_cases(self):
         h2o = gto.M(atom="O 0 0 -0.0699; H 0 0.7575 0.5184; H 0 -0.7575 0.5184",
                     basis='sto-3g', spin=2, symmetry=True, verbose=0)
         mf = dft.ROKS(h2o, xc='BHANDHLYP').density_fit().run(conv_tol=1e-11)
-        td = sfxtda.SFXTDA(mf, nstates=2, spins=(0, 2))
+        td = xtda_3t.XTDA_3T(mf, nstates=2, spins=(0, 2))
         td.wfnsym = 'A1'
         td.kernel()
         # no A1 quintet CSF exists in STO-3G: empty result instead of a crash
@@ -323,7 +324,7 @@ class KnownValues(unittest.TestCase):
         mf.conv_tol = 1e-11
         mf.run()
         self.assertAlmostEqual(mf.e_tot, -39.115068731, 7)
-        td = sfxtda.SFXTDA(mf, nstates=4, spins=(0, 1, 2))
+        td = xtda_3t.XTDA_3T(mf, nstates=4, spins=(0, 1, 2))
         td.conv_tol = 1e-7
         td.kernel()
         ref = {0: [0.332450, 0.962664, 2.408297, 7.724930],
@@ -350,7 +351,7 @@ class KnownValues(unittest.TestCase):
             mf.conv_tol = 1e-11
             mf.run()
             self.assertAlmostEqual(mf.e_tot, e_tot, 7)
-            td = sfxtda.SFXTDA(mf, nstates=4, spins=(0, 1, 2))
+            td = xtda_3t.XTDA_3T(mf, nstates=4, spins=(0, 1, 2))
             td.conv_tol = 1e-7
             td.kernel()
             for s in (0, 1, 2):
@@ -359,7 +360,7 @@ class KnownValues(unittest.TestCase):
     def test_tdm_table_vs_blocks(self):
         # one-body identity: with all integrals zero, <u|H-E0|v> = sum_pq F_pq dm(u,v)[q,p] - (u.v) tr(F gamma0)
         for spin in (0, 1, 2):
-            td = sfxtda.SFXTDA(mf_hf).build()
+            td = xtda_3t.XTDA_3T(mf_hf).build()
             ints = td._ints
             core, somo, virt = td._orbs
             nmo = mf_hf.mo_coeff.shape[1]
@@ -368,7 +369,7 @@ class KnownValues(unittest.TestCase):
             ints.fbar = f + f.T
             ints.sign[:] = 0                        # every [pq|rs] -> 0
             m1 = _dense(td, spin)
-            blocks = sfxtda.csf_list(spin, ints.nC, ints.nV)
+            blocks = xtda_3t.csf_list(spin, ints.nC, ints.nV)
             g0 = np.zeros(nmo)
             g0[core], g0[somo] = 2, 1
             for _ in range(3):
@@ -384,7 +385,7 @@ class KnownValues(unittest.TestCase):
 
     def test_tdm_vs_detci(self):
         # frozen determinant CI (DF integrals of mf_hf, explicit S^2 projection, <I|E_pq|J> from determinants)
-        td = sfxtda.SFXTDA(mf_hf, nstates=4, spins=(0, 1, 2))
+        td = xtda_3t.XTDA_3T(mf_hf, nstates=4, spins=(0, 1, 2))
         td.conv_tol = 1e-9
         td.kernel()
         core, somo, virt = td._orbs
@@ -393,7 +394,7 @@ class KnownValues(unittest.TestCase):
             1: ([13.96273182, 0.005277, 0.06708164, 0.00165499], [13.96273182, 0.9724713, 0.96974053, 0.97816456]),
             2: ([11.89982431, 0.20624961, -0.23374966, 0.13427764], [11.89982431, 0.82596076, 0.97897885, 0.29174605])}
         for s in (0, 1, 2):
-            blocks = sfxtda.csf_list(s, len(core), len(virt))
+            blocks = xtda_3t.csf_list(s, len(core), len(virt))
             dms = [_tdm.transition_dm(td.xs[s][0], td.xs[s][j], blocks, core, somo, virt) for j in range(4)]
             tr = np.array([np.trace(d @ d) for d in dms])
             fro = np.array([np.sum(d * d) for d in dms])
@@ -413,18 +414,18 @@ class KnownValues(unittest.TestCase):
         mf = mf_hf.copy()
         c = mf_hf.mo_coeff
         mf.mo_coeff = c * np.sign(c[abs(c).argmax(0), np.arange(c.shape[1])])
-        td = sfxtda.SFXTDA(mf).build()
+        td = xtda_3t.XTDA_3T(mf).build()
         core, somo, virt = td._orbs
         rng = np.random.default_rng(3)
         x = rng.standard_normal((c.shape[1],) * 2)
         for s, ref in zip((0, 1, 2), (-78.11584436, -25.77943742, -0.51561271)):
-            blocks = sfxtda.csf_list(s, len(core), len(virt))
+            blocks = xtda_3t.csf_list(s, len(core), len(virt))
             u, v = rng.standard_normal((2, sum(r * q for _, _, (r, q) in blocks)))
             dm = _tdm.transition_dm(u, v, blocks, core, somo, virt)
             self.assertAlmostEqual(np.einsum('rs,sr->', x, dm), ref, 7)
 
     def test_oscillator_strength_vs_detci(self):
-        td = sfxtda.SFXTDA(mf_hf, nstates=4, spins=(0, 1, 2))
+        td = xtda_3t.XTDA_3T(mf_hf, nstates=4, spins=(0, 1, 2))
         td.conv_tol = 1e-9
         td.kernel()
         ref = {  # frozen determinant CI: f_0J and |mu_0J|^2 (charge-centre origin), J = 0..3
@@ -452,7 +453,7 @@ class KnownValues(unittest.TestCase):
         self.assertAlmostEqual(f1[0], -td.oscillator_strength(0)[1], 10)
 
     def test_transition_dm_api(self):
-        td = sfxtda.SFXTDA(mf_ks, nstates=3, spins=(0,))
+        td = xtda_3t.XTDA_3T(mf_ks, nstates=3, spins=(0,))
         with self.assertRaises(RuntimeError):
             td.transition_dm(0, 0, 1)
         td.kernel()
@@ -468,23 +469,23 @@ class KnownValues(unittest.TestCase):
         '''Non-normalised Davidson vectors (subspace collapse, S6) are flagged unconverged.'''
         xs = np.eye(3, 5)
         xs[1] = 1e-8
-        conv = sfxtda._check_roots(xs, np.ones(3, dtype=bool), lib.logger.new_logger(mf_hf))
+        conv = xtda_3t._check_roots(xs, np.ones(3, dtype=bool), lib.logger.new_logger(mf_hf))
         self.assertEqual(conv.tolist(), [True, False, True])
 
     def test_energy_scanner(self):
         mol2 = gto.M(atom="C 0 0 0.05; H 0.1 1.02 0.5; H -0.2 -0.95 0.33", basis='6-31g', spin=2, verbose=0)
         for make in (lambda m: scf.ROHF(m).density_fit(), lambda m: scf.ROHF(m)):
-            td = sfxtda.SFXTDA(make(mol).run(conv_tol=1e-11), nstates=3)
+            td = xtda_3t.XTDA_3T(make(mol).run(conv_tol=1e-11), nstates=3)
             scanner = td.as_scanner()
             e = scanner(mol2)
-            ref = sfxtda.SFXTDA(make(mol2).run(conv_tol=1e-11), nstates=3)
+            ref = xtda_3t.XTDA_3T(make(mol2).run(conv_tol=1e-11), nstates=3)
             ref.kernel()
             for s in (0, 1):
                 self.assertAlmostEqual(abs(e[s] - ref.e_tot[s]).max(), 0, 7)
             self.assertIs(scanner._with_df.mol, mol2)       # no stale DF tensors / auxmol
 
     def test_reset_clears(self):
-        td = sfxtda.SFXTDA(scf.ROHF(mol).density_fit().run(conv_tol=1e-11), nstates=2)
+        td = xtda_3t.XTDA_3T(scf.ROHF(mol).density_fit().run(conv_tol=1e-11), nstates=2)
         td.kernel()
         self.assertIsNotNone(td._with_df)
         td.reset()
@@ -493,7 +494,7 @@ class KnownValues(unittest.TestCase):
 
     def test_rdm2_random_integrals(self):
         '''sum_L s_L <Y[B]^L, B^L> == x.(H-E0).x for random B, random signs, Fbar = 0 and random x.'''
-        td = sfxtda.SFXTDA(mf_hf, spins=(0, 1, 2)).build()
+        td = xtda_3t.XTDA_3T(mf_hf, spins=(0, 1, 2)).build()
         ints = td._ints
         core, somo, virt = td._orbs
         nmo = mf_hf.mo_coeff.shape[1]
@@ -509,13 +510,13 @@ class KnownValues(unittest.TestCase):
         for spin in (0, 1, 2):
             vind, hdiag = td.gen_vind(spin)
             x = rng.standard_normal(hdiag.size)
-            y = _rdm2.contract(x, sfxtda.csf_list(spin, len(core), len(virt)), b, core, somo, virt)
+            y = _rdm2.contract(x, xtda_3t.csf_list(spin, len(core), len(virt)), b, core, somo, virt)
             self.assertAlmostEqual(np.einsum('L,Lpq,Lpq->', sign, y, b), x @ vind(x[None])[0], 9)
 
     def test_rdm2_eigvec_identity(self):
         '''omega_k == tr(P Fbar) + sum_L s_L <Y[B]^L, B^L> for converged roots (global and RSH kernels).'''
         for mf in (mf_hf, mf_cam, mf_neg):
-            td = sfxtda.SFXTDA(mf, nstates=3, spins=(0, 1, 2))
+            td = xtda_3t.XTDA_3T(mf, nstates=3, spins=(0, 1, 2))
             td.kernel()
             core, somo, virt = td._orbs
             b, sign = _full_b(td)
@@ -525,14 +526,14 @@ class KnownValues(unittest.TestCase):
                 for k in range(len(td.omega[spin])):
                     x = td.xs[spin][k]
                     p = td.transition_dm(spin, k, k) - np.diag(g0)
-                    y = _rdm2.contract(x, sfxtda.csf_list(spin, len(core), len(virt)), b, core, somo, virt)
-                    fbar = sfxtda._reference(mf)[4]                       # full-MO Fbar
+                    y = _rdm2.contract(x, xtda_3t.csf_list(spin, len(core), len(virt)), b, core, somo, virt)
+                    fbar = xtda_3t._reference(mf)[4]                       # full-MO Fbar
                     e = np.einsum('pq,pq', p, fbar) + np.einsum('L,Lpq,Lpq->', sign, y, b)
                     self.assertAlmostEqual(e, td.omega[spin][k], 8)
 
     def test_rdm2_pair_symmetry(self):
         '''<Y[F], G> == <F, Y[G]> and Y symmetric in pq.'''
-        td = sfxtda.SFXTDA(mf_hf, nstates=2)
+        td = xtda_3t.XTDA_3T(mf_hf, nstates=2)
         td.kernel()
         core, somo, virt = td._orbs
         rng = np.random.default_rng(3)
@@ -540,7 +541,7 @@ class KnownValues(unittest.TestCase):
         f, g = rng.standard_normal((2, 4, nmo, nmo))
         f += f.transpose(0, 2, 1)
         g += g.transpose(0, 2, 1)
-        blocks = sfxtda.csf_list(1, len(core), len(virt))
+        blocks = xtda_3t.csf_list(1, len(core), len(virt))
         x = td.xs[1][0]
         yf = _rdm2.contract(x, blocks, f, core, somo, virt)
         yg = _rdm2.contract(x, blocks, g, core, somo, virt)
@@ -549,14 +550,14 @@ class KnownValues(unittest.TestCase):
 
     def test_rdm2_contract_bilinear(self):
         '''contract(x, x2=y) is the polarisation [Y(x+y) - Y(x-y)]/4 of the quadratic contraction.'''
-        td = sfxtda.SFXTDA(mf_ks).build()
+        td = xtda_3t.XTDA_3T(mf_ks).build()
         core, somo, virt = td._orbs
         rng = np.random.default_rng(11)
         nmo = len(core) + len(somo) + len(virt)
         f = rng.standard_normal((3, nmo, nmo))
         f = f + f.transpose(0, 2, 1)
         for spin in (0, 1, 2):
-            blocks = sfxtda.csf_list(spin, len(core), len(virt))
+            blocks = xtda_3t.csf_list(spin, len(core), len(virt))
             x, y = rng.standard_normal((2, sum(r * c for _, _, (r, c) in blocks)))
             ref = (_rdm2.contract(x + y, blocks, f, core, somo, virt)
                    - _rdm2.contract(x - y, blocks, f, core, somo, virt)) / 4
@@ -572,7 +573,7 @@ class KnownValues(unittest.TestCase):
         for mf in (mf_hf, mf_ks):
             tds = []
             for m in (mf, _rotated(mf, 5)):
-                td = sfxtda.SFXTDA(m, nstates=3, spins=(0, 1, 2), damping=(1., 8.))
+                td = xtda_3t.XTDA_3T(m, nstates=3, spins=(0, 1, 2), damping=(2., 5))
                 td.conv_tol = 1e-8
                 td.kernel()
                 tds.append(td)
@@ -596,7 +597,7 @@ class KnownValues(unittest.TestCase):
         mf = scf.ROHF(m).density_fit().run(conv_tol=1e-11)
         tds = []
         for mm in (mf, _rotated(mf, 9, by_irrep=True)):
-            td = sfxtda.SFXTDA(mm, nstates=3, spins=(0, 1), damping=(1., 8.))
+            td = xtda_3t.XTDA_3T(mm, nstates=3, spins=(0, 1), damping=(2., 5))
             td.conv_tol = 1e-8
             td.kernel()
             tds.append(td)
@@ -606,7 +607,7 @@ class KnownValues(unittest.TestCase):
 
     def test_weighted_dm_vs_dense(self):
         '''sum W.H == tr(P_W Fbar) for random symmetric CSF weights, random Fbar, all integrals zero.'''
-        td = sfxtda.SFXTDA(mf_hf, spins=(0, 1, 2)).build()
+        td = xtda_3t.XTDA_3T(mf_hf, spins=(0, 1, 2)).build()
         ints = td._ints
         core, somo, virt = td._orbs
         nmo = mf_hf.mo_coeff.shape[1]
@@ -618,7 +619,7 @@ class KnownValues(unittest.TestCase):
                                                  for b in (ints.bcc, ints.bcv, ints.bvv, ints.bo))
         ints.fbar, ints._cache = fbar, {}
         for spin in (0, 1, 2):
-            blocks = sfxtda.csf_list(spin, len(core), len(virt))
+            blocks = xtda_3t.csf_list(spin, len(core), len(virt))
             wss, wsl, gl = _random_weights(rng, *_sizes(spin, len(core), len(virt)))
             p = _tdm.weighted_dm(wss, wsl, gl, blocks, core, somo, virt)
             self.assertAlmostEqual(abs(p - p.T).max(), 0, 12)
@@ -626,7 +627,7 @@ class KnownValues(unittest.TestCase):
 
     def test_contract_weighted_vs_dense(self):
         '''sum W.H == sum_L s_L <Y_W[B]^L, B^L> for random weights, random B and signs, Fbar = 0.'''
-        td = sfxtda.SFXTDA(mf_hf, spins=(0, 1, 2)).build()
+        td = xtda_3t.XTDA_3T(mf_hf, spins=(0, 1, 2)).build()
         ints = td._ints
         core, somo, virt = td._orbs
         nmo = mf_hf.mo_coeff.shape[1]
@@ -640,7 +641,7 @@ class KnownValues(unittest.TestCase):
         ints.fbar = np.zeros_like(ints.fbar)
         ints._cache = {}
         for spin in (0, 1, 2):
-            blocks = sfxtda.csf_list(spin, len(core), len(virt))
+            blocks = xtda_3t.csf_list(spin, len(core), len(virt))
             wss, wsl, gl = _random_weights(rng, *_sizes(spin, len(core), len(virt)))
             y = _rdm2.contract_weighted(wss, wsl, gl, blocks, b, core, somo, virt)
             self.assertAlmostEqual(abs(y - y.transpose(0, 2, 1)).max(), 0, 12)
@@ -648,5 +649,5 @@ class KnownValues(unittest.TestCase):
                                    np.sum(_dense_w(wss, wsl, gl) * _dense(td, spin)), 9)
 
 if __name__ == "__main__":
-    print("Full Tests for SF-XTDA")
+    print("Full Tests for XTDA-3T")
     unittest.main()
